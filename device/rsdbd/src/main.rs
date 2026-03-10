@@ -44,6 +44,7 @@ struct Args {
 struct ServerState {
     server_id: Arc<str>,
     device_name: Arc<str>,
+    platform: Arc<str>,
     exec_timeout: Duration,
     tcp_port: u16,
 }
@@ -70,10 +71,12 @@ async fn main() -> Result<()> {
         .local_addr()
         .context("failed to read bound tcp listener address")?;
     let server_id = args.server_id.unwrap_or_else(default_server_id);
-    let device_name = default_device_name(&server_id);
+    let device_name = detect_device_name(&server_id);
+    let platform = detect_platform();
     let state = ServerState {
         server_id: Arc::from(server_id),
         device_name: Arc::from(device_name),
+        platform: Arc::from(platform),
         exec_timeout: Duration::from_secs(args.exec_timeout_secs),
         tcp_port: listen_addr.port(),
     };
@@ -139,11 +142,77 @@ fn default_server_id() -> String {
         .unwrap_or_else(|| "rsdbd".to_string())
 }
 
-fn default_device_name(server_id: &str) -> String {
-    std::env::var("RSDB_DEVICE_NAME")
+fn detect_device_name(server_id: &str) -> String {
+    detect_hostname().unwrap_or_else(|| server_id.to_string())
+}
+
+fn detect_hostname() -> Option<String> {
+    // /etc/hostname — standard on Tizen/Linux
+    if let Some(name) = std::fs::read_to_string("/etc/hostname")
         .ok()
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| server_id.to_string())
+        .map(|s| clean_hostname(s.trim()))
+        .filter(|s| is_useful_hostname(s))
+    {
+        return Some(name);
+    }
+
+    // `uname -n` — part of coreutils, always present on Linux/macOS/Tizen
+    if let Some(name) = run_command("uname -n")
+        .map(|s| clean_hostname(&s))
+        .filter(|s| is_useful_hostname(s))
+    {
+        return Some(name);
+    }
+
+    None
+}
+
+fn clean_hostname(name: &str) -> String {
+    name.strip_suffix(".local").unwrap_or(name).to_string()
+}
+
+fn is_useful_hostname(name: &str) -> bool {
+    !name.is_empty() && name != "localhost" && name != "(none)"
+}
+
+fn detect_platform() -> String {
+    let os_name = detect_os_name();
+    let arch = std::env::consts::ARCH;
+    format!("{os_name} ({arch})")
+}
+
+fn detect_os_name() -> String {
+    // /etc/os-release PRETTY_NAME — standard on Tizen/Linux
+    if let Some(name) = std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|content| {
+            content.lines().find_map(|line| {
+                let value = line.strip_prefix("PRETTY_NAME=")?;
+                let value = value.trim().trim_matches('"');
+                (!value.is_empty()).then(|| value.to_string())
+            })
+        })
+    {
+        return name;
+    }
+
+    // `uname -sr` — works everywhere, gives OS name + version (e.g. "Linux 5.10.0")
+    run_command("uname -sr").unwrap_or_else(|| std::env::consts::OS.to_string())
+}
+
+fn run_command(cmd: &str) -> Option<String> {
+    let mut parts = cmd.split_whitespace();
+    let program = parts.next()?;
+    let args: Vec<&str> = parts.collect();
+    let output = std::process::Command::new(program)
+        .args(&args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 async fn handle_discovery(socket: UdpSocket, state: ServerState) -> Result<()> {
@@ -168,6 +237,7 @@ async fn handle_discovery(socket: UdpSocket, state: ServerState) -> Result<()> {
                     nonce,
                     server_id: state.server_id.to_string(),
                     device_name: state.device_name.to_string(),
+                    platform: state.platform.to_string(),
                     tcp_port: state.tcp_port,
                     protocol_version: PROTOCOL_VERSION,
                     features: capabilities().features,

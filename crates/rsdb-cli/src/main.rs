@@ -115,11 +115,9 @@ struct Registry {
 
 #[derive(Debug, Clone)]
 struct DiscoveredTarget {
-    server_id: String,
     device_name: String,
     addr: SocketAddr,
-    protocol_version: u16,
-    features: Vec<String>,
+    platform: String,
 }
 
 #[tokio::main]
@@ -238,15 +236,28 @@ async fn discover_command(probe_addr: &str, port: u16, timeout_ms: u64) -> Resul
         return Ok(());
     }
 
-    for target in targets {
-        let features = if target.features.is_empty() {
-            "-".to_string()
-        } else {
-            target.features.join(",")
-        };
+    let name_width = targets
+        .iter()
+        .map(|t| t.device_name.len())
+        .max()
+        .unwrap_or(0)
+        .max(4);
+    let addr_width = targets
+        .iter()
+        .map(|t| t.addr.to_string().len())
+        .max()
+        .unwrap_or(0)
+        .max(7);
+    println!(
+        "{:<name_width$}   {:<addr_width$}   PLATFORM",
+        "NAME", "ADDRESS",
+    );
+    for target in &targets {
         println!(
-            "{}\t{}\t{}\tprotocol={}\t{}",
-            target.device_name, target.addr, target.server_id, target.protocol_version, features
+            "{:<name_width$}   {:<addr_width$}   {}",
+            target.device_name,
+            target.addr,
+            target.platform,
         );
     }
     Ok(())
@@ -260,7 +271,7 @@ async fn discover_targets(
     let mut discovered = BTreeMap::<String, DiscoveredTarget>::new();
     for probe_ip in discovery_probe_addresses(probe_addr)? {
         for target in discover_targets_once(probe_ip, port, timeout_ms).await? {
-            let key = format!("{}@{}", target.server_id, target.addr);
+            let key = format!("{}@{}", target.device_name, target.addr);
             discovered.insert(key, target);
         }
     }
@@ -337,11 +348,9 @@ async fn discover_targets_once(
         discovered.insert(
             key,
             DiscoveredTarget {
-                server_id: response.server_id,
                 device_name: response.device_name,
                 addr,
-                protocol_version: response.protocol_version,
-                features: response.features,
+                platform: response.platform,
             },
         );
     }

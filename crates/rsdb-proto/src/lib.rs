@@ -141,6 +141,7 @@ pub struct DiscoveryResponse {
     pub nonce: u64,
     pub server_id: String,
     pub device_name: String,
+    pub platform: String,
     pub tcp_port: u16,
     pub protocol_version: u16,
     pub features: Vec<String>,
@@ -472,6 +473,7 @@ mod tests {
             nonce: 7,
             server_id: "rsdbd-test".to_string(),
             device_name: "test-device".to_string(),
+            platform: "Tizen 10.0 (aarch64)".to_string(),
             tcp_port: 27101,
             protocol_version: PROTOCOL_VERSION,
             features: vec!["discover.udp".to_string(), "shell.exec".to_string()],
@@ -482,4 +484,5 @@ mod tests {
             decode_discovery_message(&encoded).expect("discovery should decode");
         assert_eq!(decoded, expected);
     }
+
 }
