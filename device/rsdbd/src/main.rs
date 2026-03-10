@@ -1,6 +1,7 @@
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{fs::OpenOptions as StdOpenOptions, io};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -42,7 +43,7 @@ struct ServerState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
+    init_tracing()?;
     let args = Args::parse();
     let listener = TcpListener::bind(&args.listen)
         .await
@@ -85,14 +86,32 @@ async fn main() -> Result<()> {
     }
 }
 
-fn init_tracing() {
+fn init_tracing() -> Result<()> {
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "off".into());
-    tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .compact()
-        .init();
+        .compact();
+    if let Some(log_file) = std::env::var("RSDB_LOG_FILE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let file = StdOpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file)
+            .with_context(|| format!("failed to open log file: {log_file}"))?;
+        builder
+            .with_writer(move || {
+                file.try_clone()
+                    .unwrap_or_else(|err| panic!("failed to clone log file handle: {err}"))
+            })
+            .init();
+    } else {
+        builder.with_writer(io::stderr).init();
+    }
+    Ok(())
 }
 
 fn default_server_id() -> String {

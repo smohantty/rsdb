@@ -80,10 +80,14 @@ The script installs:
 
 - binary to `/usr/bin/rsdbd`
 - service file to `/usr/lib/systemd/system/rsdbd.service`
+- environment file to `/etc/rsdbd.env` on first install with `RUST_LOG=debug`
+- environment file default `RSDB_LOG_FILE=/var/log/rsdbd.log`
+- log output to `/var/log/rsdbd.log`
 
 If the service is already active, it stops it before reinstalling and then restarts it.
 After restart, the script prints service status and recent logs so you can confirm the daemon came back successfully.
 If you need different paths, edit the variables at the top of `scripts/deploy-tizen.sh`.
+If everything works and you want quiet operation, change `RUST_LOG=debug` to `RUST_LOG=off` in `/etc/rsdbd.env` and restart `rsdbd.service`.
 
 ## Build
 

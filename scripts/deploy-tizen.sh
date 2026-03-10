@@ -5,6 +5,8 @@ BINARY_PATH="./rsdbd"
 SERVICE_FILE="./rsdbd.service"
 INSTALL_BIN="/usr/bin/rsdbd"
 INSTALL_SERVICE="/usr/lib/systemd/system/rsdbd.service"
+ENV_FILE="/etc/rsdbd.env"
+LOG_FILE="/var/log/rsdbd.log"
 SERVICE_NAME="rsdbd.service"
 
 if [[ $# -ne 0 ]]; then
@@ -50,6 +52,17 @@ echo "Installing binary to $INSTALL_BIN"
 install -Dm755 "$BINARY_PATH" "$INSTALL_BIN"
 echo "Installing service file to $INSTALL_SERVICE"
 install -Dm644 "$SERVICE_FILE" "$INSTALL_SERVICE"
+echo "Ensuring log file exists at $LOG_FILE"
+install -Dm644 /dev/null "$LOG_FILE"
+if [[ ! -f "$ENV_FILE" ]]; then
+    echo "Creating default environment file at $ENV_FILE"
+    cat >"$ENV_FILE" <<'EOF'
+RUST_LOG=debug
+RSDB_LOG_FILE=/var/log/rsdbd.log
+EOF
+else
+    echo "Keeping existing environment file at $ENV_FILE"
+fi
 
 echo "Reloading systemd"
 systemctl daemon-reload
@@ -71,3 +84,5 @@ fi
 
 echo "Installed rsdbd to $INSTALL_BIN"
 echo "Installed service to $INSTALL_SERVICE"
+echo "Runtime env file: $ENV_FILE"
+echo "Log file: $LOG_FILE"
