@@ -165,23 +165,21 @@ async fn handle_discovery(socket: UdpSocket, state: ServerState) -> Result<()> {
 }
 
 async fn handle_connection(mut stream: TcpStream, state: ServerState) -> Result<()> {
-    loop {
-        let frame = match read_frame(&mut stream).await {
-            Ok(frame) => frame,
-            Err(ProtocolError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(());
-            }
-            Err(err) => return Err(err.into()),
-        };
+    let frame = match read_frame(&mut stream).await {
+        Ok(frame) => frame,
+        Err(ProtocolError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
 
-        let request_id = frame.header.request_id;
-        let request: ControlRequest = decode_json(&frame, FrameKind::Request)?;
-        handle_request(&mut stream, request_id, request, &state).await?;
-    }
+    let request_id = frame.header.request_id;
+    let request: ControlRequest = decode_json(&frame, FrameKind::Request)?;
+    handle_request(stream, request_id, request, &state).await
 }
 
 async fn handle_request(
-    stream: &mut TcpStream,
+    mut stream: TcpStream,
     request_id: u32,
     request: ControlRequest,
     state: &ServerState,
@@ -192,14 +190,14 @@ async fn handle_request(
                 server_id: state.server_id.to_string(),
                 protocol_version: PROTOCOL_VERSION,
             };
-            write_json_frame(stream, FrameKind::Response, request_id, &response).await?;
+            write_json_frame(&mut stream, FrameKind::Response, request_id, &response).await?;
         }
         ControlRequest::GetCapabilities => {
             let response = ControlResponse::Capabilities {
                 server_id: state.server_id.to_string(),
                 capability: capabilities(),
             };
-            write_json_frame(stream, FrameKind::Response, request_id, &response).await?;
+            write_json_frame(&mut stream, FrameKind::Response, request_id, &response).await?;
         }
         ControlRequest::Exec { command, args } => {
             let response = match execute_command(&command, &args, state).await {
@@ -209,11 +207,11 @@ async fn handle_request(
                     message: err.to_string(),
                 },
             };
-            write_json_frame(stream, FrameKind::Response, request_id, &response).await?;
+            write_json_frame(&mut stream, FrameKind::Response, request_id, &response).await?;
         }
         ControlRequest::Push { path, mode } => {
-            if let Err(err) = handle_push(stream, request_id, &path, mode).await {
-                send_error(stream, request_id, ErrorCode::FileTransferFailed, err).await?;
+            if let Err(err) = handle_push(&mut stream, request_id, &path, mode).await {
+                send_error(&mut stream, request_id, ErrorCode::FileTransferFailed, err).await?;
             }
         }
         ControlRequest::Pull { path } => {
@@ -223,13 +221,13 @@ async fn handle_request(
             } else {
                 ErrorCode::FileTransferFailed
             };
-            if let Err(err) = handle_pull(stream, request_id, &path).await {
-                send_error(stream, request_id, code, err).await?;
+            if let Err(err) = handle_pull(&mut stream, request_id, &path).await {
+                send_error(&mut stream, request_id, code, err).await?;
             }
         }
         ControlRequest::Shell { command, args } => {
             if let Err(err) = handle_shell(stream, request_id, command, args).await {
-                send_error(stream, request_id, ErrorCode::ExecFailed, err).await?;
+                return Err(err);
             }
         }
     }
@@ -390,14 +388,28 @@ async fn handle_pull(stream: &mut TcpStream, request_id: u32, path: &str) -> Res
 }
 
 async fn handle_shell(
-    stream: &mut TcpStream,
+    stream: TcpStream,
     request_id: u32,
     command: Option<String>,
     args: Vec<String>,
 ) -> Result<()> {
     let (display_command, mut child) = spawn_shell(command, args)?;
+    let (mut reader, mut writer) = stream.into_split();
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(32);
+    tokio::spawn(async move {
+        loop {
+            let frame = read_frame(&mut reader).await;
+            let should_stop = frame.is_err();
+            if frame_tx.send(frame).await.is_err() {
+                break;
+            }
+            if should_stop {
+                break;
+            }
+        }
+    });
     write_json_frame(
-        stream,
+        &mut writer,
         FrameKind::Response,
         request_id,
         &ControlResponse::ShellStarted {
@@ -428,9 +440,9 @@ async fn handle_shell(
 
     while stdout_open || stderr_open || exit_status.is_none() {
         tokio::select! {
-            frame = read_frame(stream), if stdin_open => {
+            frame = frame_rx.recv(), if stdin_open => {
                 match frame {
-                    Ok(frame) => {
+                    Some(Ok(frame)) => {
                         let chunk = decode_stream_frame(&frame)?;
                         expect_stream_chunk(&chunk, request_id, StreamChannel::Stdin)?;
                         if !chunk.payload.is_empty() {
@@ -442,21 +454,28 @@ async fn handle_shell(
                             stdin_open = false;
                         }
                     }
-                    Err(ProtocolError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    Some(Err(ProtocolError::Io(err))) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
                         let _ = child_stdin.shutdown().await;
                         stdin_open = false;
                     }
-                    Err(err) => return Err(err.into()),
+                    Some(Err(err)) => {
+                        send_error(&mut writer, request_id, ErrorCode::ExecFailed, err.into()).await?;
+                        return Ok(());
+                    }
+                    None => {
+                        let _ = child_stdin.shutdown().await;
+                        stdin_open = false;
+                    }
                 }
             }
             read = child_stdout.read(&mut stdout_buffer), if stdout_open => {
                 let read = read?;
                 if read == 0 {
                     stdout_open = false;
-                    write_stream_frame(stream, request_id, StreamChannel::Stdout, true, &[]).await?;
+                    write_stream_frame(&mut writer, request_id, StreamChannel::Stdout, true, &[]).await?;
                 } else {
                     write_stream_frame(
-                        stream,
+                        &mut writer,
                         request_id,
                         StreamChannel::Stdout,
                         false,
@@ -468,10 +487,10 @@ async fn handle_shell(
                 let read = read?;
                 if read == 0 {
                     stderr_open = false;
-                    write_stream_frame(stream, request_id, StreamChannel::Stderr, true, &[]).await?;
+                    write_stream_frame(&mut writer, request_id, StreamChannel::Stderr, true, &[]).await?;
                 } else {
                     write_stream_frame(
-                        stream,
+                        &mut writer,
                         request_id,
                         StreamChannel::Stderr,
                         false,
@@ -501,7 +520,7 @@ async fn handle_shell(
             .context("failed to wait for shell process")?,
     };
     write_json_frame(
-        stream,
+        &mut writer,
         FrameKind::Response,
         request_id,
         &ControlResponse::ShellExit {
@@ -591,12 +610,15 @@ fn expect_stream_chunk(
     Ok(())
 }
 
-async fn send_error(
-    stream: &mut TcpStream,
+async fn send_error<W>(
+    stream: &mut W,
     request_id: u32,
     code: ErrorCode,
     err: anyhow::Error,
-) -> Result<()> {
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let response = ControlResponse::Error {
         code,
         message: err.to_string(),

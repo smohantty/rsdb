@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::BufRead as _;
+use std::io::Read as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,13 +23,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-use tracing::debug;
+use tracing::{debug, trace};
 
 const REQUEST_ID: u32 = 1;
 
 enum StdinChunk {
     Data(Vec<u8>),
-    CloseAfter(Vec<u8>),
     Eof,
     Error(String),
 }
@@ -560,15 +559,28 @@ async fn run_shell_session(
         }
         other => bail!("unexpected response from daemon: {other:?}"),
     }
+    let (mut reader, mut writer) = stream.into_split();
+    let (frame_tx, mut frame_rx) = mpsc::channel(32);
+    tokio::spawn(async move {
+        loop {
+            let frame = read_frame(&mut reader).await;
+            let should_stop = frame.is_err();
+            if frame_tx.send(frame).await.is_err() {
+                break;
+            }
+            if should_stop {
+                break;
+            }
+        }
+    });
 
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
     let mut stdin_open = interactive;
-    let mut closing_requested = false;
     let mut stdin_rx = interactive.then(start_stdin_pump);
 
     if !interactive {
-        write_stream_frame(&mut stream, REQUEST_ID, StreamChannel::Stdin, true, &[])
+        write_stream_frame(&mut writer, REQUEST_ID, StreamChannel::Stdin, true, &[])
             .await
             .context("failed to close remote stdin")?;
     }
@@ -578,8 +590,9 @@ async fn run_shell_session(
             chunk = recv_stdin_chunk(&mut stdin_rx), if stdin_open => {
                 match chunk {
                     Some(StdinChunk::Data(data)) => {
+                        trace!(bytes = data.len(), eof = false, "forwarding shell stdin chunk");
                         write_stream_frame(
-                            &mut stream,
+                            &mut writer,
                             REQUEST_ID,
                             StreamChannel::Stdin,
                             false,
@@ -587,30 +600,27 @@ async fn run_shell_session(
                         )
                         .await
                         .context("failed to forward stdin")?;
-                    }
-                    Some(StdinChunk::CloseAfter(data)) => {
-                        write_stream_frame(
-                            &mut stream,
-                            REQUEST_ID,
-                            StreamChannel::Stdin,
-                            false,
-                            &data,
-                        )
-                        .await
-                        .context("failed to forward stdin")?;
-                        write_stream_frame(&mut stream, REQUEST_ID, StreamChannel::Stdin, true, &[])
+                        if should_close_stdin_after_chunk(&data) {
+                            trace!("closing shell stdin after exit/logout command");
+                            write_stream_frame(
+                                &mut writer,
+                                REQUEST_ID,
+                                StreamChannel::Stdin,
+                                true,
+                                &[],
+                            )
                             .await
                             .context("failed to finish stdin stream")?;
-                        stdin_open = false;
-                        closing_requested = true;
-                        stdin_rx = None;
+                            stdin_open = false;
+                            stdin_rx = None;
+                        }
                     }
                     Some(StdinChunk::Eof) | None => {
-                        write_stream_frame(&mut stream, REQUEST_ID, StreamChannel::Stdin, true, &[])
+                        trace!("forwarding shell stdin eof");
+                        write_stream_frame(&mut writer, REQUEST_ID, StreamChannel::Stdin, true, &[])
                             .await
                             .context("failed to finish stdin stream")?;
                         stdin_open = false;
-                        closing_requested = true;
                         stdin_rx = None;
                     }
                     Some(StdinChunk::Error(message)) => {
@@ -618,8 +628,13 @@ async fn run_shell_session(
                     }
                 }
             }
-            frame = read_frame(&mut stream) => {
-                let frame = frame.context("failed to read shell frame")?;
+            frame = frame_rx.recv() => {
+                let frame = match frame {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(err)) => return Err(anyhow!("failed to read shell frame: {err}")),
+                    None => return Err(anyhow!("shell connection closed unexpectedly")),
+                };
+                trace!(kind = ?frame.header.kind, payload = frame.payload.len(), "received shell frame");
                 match frame.header.kind {
                     FrameKind::Stream => {
                         let chunk = decode_stream_frame(&frame).context("invalid stream frame")?;
@@ -661,11 +676,6 @@ async fn run_shell_session(
                     other => bail!("unexpected frame kind during shell: {other:?}"),
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(250)), if closing_requested => {
-                stdout.flush().await?;
-                stderr.flush().await?;
-                return Ok(());
-            }
         }
     }
 }
@@ -675,28 +685,19 @@ fn start_stdin_pump() -> mpsc::Receiver<StdinChunk> {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut locked = stdin.lock();
-        let mut line = String::new();
+        let mut buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
         loop {
-            line.clear();
-            match locked.read_line(&mut line) {
+            match locked.read(&mut buffer) {
                 Ok(0) => {
                     let _ = tx.blocking_send(StdinChunk::Eof);
                     break;
                 }
-                Ok(_) => {
-                    let should_close = matches!(
-                        line.split_whitespace().next(),
-                        Some("exit") | Some("logout")
-                    );
-                    let chunk = if should_close {
-                        StdinChunk::CloseAfter(line.as_bytes().to_vec())
-                    } else {
-                        StdinChunk::Data(line.as_bytes().to_vec())
-                    };
-                    if tx.blocking_send(chunk).is_err() {
-                        break;
-                    }
-                    if should_close {
+                Ok(read) => {
+                    trace!(bytes = read, "read local shell stdin");
+                    if tx
+                        .blocking_send(StdinChunk::Data(buffer[..read].to_vec()))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -715,6 +716,13 @@ async fn recv_stdin_chunk(stdin_rx: &mut Option<mpsc::Receiver<StdinChunk>>) -> 
         Some(rx) => rx.recv().await,
         None => None,
     }
+}
+
+fn should_close_stdin_after_chunk(data: &[u8]) -> bool {
+    std::str::from_utf8(data)
+        .ok()
+        .map(str::trim)
+        .is_some_and(|line| matches!(line, "exit" | "logout"))
 }
 
 fn print_capability(addr: &str, server_id: &str, capability: &CapabilitySet) -> Result<()> {
