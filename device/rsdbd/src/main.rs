@@ -1,6 +1,6 @@
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -96,22 +96,16 @@ fn init_tracing() {
 }
 
 fn default_server_id() -> String {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("rsdbd-{ts}")
+    std::env::var("RSDB_SERVER_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "rsdbd".to_string())
 }
 
 fn default_device_name(server_id: &str) -> String {
     std::env::var("RSDB_DEVICE_NAME")
         .ok()
         .filter(|name| !name.trim().is_empty())
-        .or_else(|| {
-            std::env::var("HOSTNAME")
-                .ok()
-                .filter(|name| !name.trim().is_empty())
-        })
         .unwrap_or_else(|| server_id.to_string())
 }
 

@@ -60,7 +60,7 @@ Copy these files to the target device into the same directory:
 - `rsdbd.service`
 - `deploy-tizen.sh`
 
-Use [scripts/deploy-tizen.sh](/home/suv-jetson/work/rsdb/scripts/deploy-tizen.sh) and the default service file from [packaging/systemd/rsdbd.service](/home/suv-jetson/work/rsdb/packaging/systemd/rsdbd.service). The service starts `rsdbd` on `0.0.0.0:27101`.
+Use `scripts/deploy-tizen.sh` and the default service file from `packaging/systemd/rsdbd.service`. The service starts `rsdbd` on `0.0.0.0:27101`.
 
 You can use any transport you want for that copy step: `scp`, `sdb`, removable media, or your own tooling.
 
@@ -79,11 +79,11 @@ The default current-directory inputs are:
 The script installs:
 
 - binary to `/usr/bin/rsdbd`
-- service file to `/etc/systemd/system/rsdbd.service`
+- service file to `/usr/lib/systemd/system/rsdbd.service`
 
 If the service is already active, it stops it before reinstalling and then restarts it.
 After restart, the script prints service status and recent logs so you can confirm the daemon came back successfully.
-If you need different paths, edit the variables at the top of [deploy-tizen.sh](/home/suv-jetson/work/rsdb/scripts/deploy-tizen.sh).
+If you need different paths, edit the variables at the top of `scripts/deploy-tizen.sh`.
 
 ## Build
 

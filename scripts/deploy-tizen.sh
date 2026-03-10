@@ -4,7 +4,7 @@ set -euo pipefail
 BINARY_PATH="./rsdbd"
 SERVICE_FILE="./rsdbd.service"
 INSTALL_BIN="/usr/bin/rsdbd"
-INSTALL_SERVICE="/etc/systemd/system/rsdbd.service"
+INSTALL_SERVICE="/usr/lib/systemd/system/rsdbd.service"
 SERVICE_NAME="rsdbd.service"
 
 if [[ $# -ne 0 ]]; then

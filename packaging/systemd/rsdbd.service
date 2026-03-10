@@ -1,14 +1,13 @@
 [Unit]
 Description=RSDB root daemon
-After=network-online.target
-Wants=network-online.target
+After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/rsdbd --listen 0.0.0.0:27101
+Environment=RSDB_DEVICE_NAME=%H
+ExecStart=/usr/bin/rsdbd --listen 0.0.0.0:27101 --server-id rsdbd-%m
 Restart=on-failure
 RestartSec=2
-NoNewPrivileges=false
 
 [Install]
 WantedBy=multi-user.target
