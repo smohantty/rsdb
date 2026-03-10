@@ -6,6 +6,8 @@ use std::{fs::File as StdFile, fs::OpenOptions as StdOpenOptions, io};
 use std::path::PathBuf;
 
 #[cfg(unix)]
+use std::os::fd::FromRawFd as _;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -16,6 +18,7 @@ use rsdb_proto::{
     ProtocolError, StreamChannel, decode_discovery_message, decode_json, decode_stream_frame,
     encode_discovery_message, read_frame, write_json_frame, write_stream_frame,
 };
+use rustix_openpty::rustix::fd::IntoRawFd as _;
 use rustix_openpty::rustix::termios::Winsize;
 use rustix_openpty::{login_tty, openpty};
 use tokio::fs::{File, OpenOptions, metadata};
@@ -793,8 +796,9 @@ fn spawn_pty_shell(
     };
 
     let winsize = shell_winsize(rows, cols);
-    let pty = openpty(None, winsize.as_ref()).context("failed to allocate PTY")?;
-    let controller = StdFile::from(pty.controller);
+    let pty = openpty(None, winsize.as_ref())
+        .map_err(|err| anyhow!("failed to allocate PTY: os error {}", err.raw_os_error()))?;
+    let controller = unsafe { StdFile::from_raw_fd(pty.controller.into_raw_fd()) };
     let mut user = Some(pty.user);
 
     let mut child = Command::new(&program);
@@ -808,7 +812,7 @@ fn spawn_pty_shell(
             let user = user
                 .take()
                 .ok_or_else(|| std::io::Error::other("PTY slave already consumed"))?;
-            login_tty(user).map_err(std::io::Error::from)?;
+            login_tty(user).map_err(rustix_errno_to_io_error)?;
             Ok(())
         });
     }
@@ -892,6 +896,10 @@ fn is_pty_closed_error(err: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::UnexpectedEof
     ) || err.raw_os_error() == Some(5)
+}
+
+fn rustix_errno_to_io_error(err: rustix_openpty::rustix::io::Errno) -> std::io::Error {
+    std::io::Error::from_raw_os_error(err.raw_os_error())
 }
 
 fn default_shell() -> String {
