@@ -51,7 +51,7 @@ cargo install --path crates/rsdb-cli --root /usr/local --force
 Build `rsdbd` for the Tizen target architecture on the host first:
 
 ```bash
-cargo build --release -p rsdbd --target aarch64-unknown-linux-gnu
+cargo tizen build --release -- -p rsdbd
 ```
 
 Copy these files to the target device into the same directory:
