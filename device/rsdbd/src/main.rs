@@ -1,7 +1,9 @@
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{fs::OpenOptions as StdOpenOptions, io};
+use std::{fs::File as StdFile, fs::OpenOptions as StdOpenOptions, io};
+
+use std::path::PathBuf;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -14,6 +16,8 @@ use rsdb_proto::{
     ProtocolError, StreamChannel, decode_discovery_message, decode_json, decode_stream_frame,
     encode_discovery_message, read_frame, write_json_frame, write_stream_frame,
 };
+use rustix_openpty::rustix::termios::Winsize;
+use rustix_openpty::{login_tty, openpty};
 use tokio::fs::{File, OpenOptions, metadata};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -39,6 +43,17 @@ struct ServerState {
     device_name: Arc<str>,
     exec_timeout: Duration,
     tcp_port: u16,
+}
+
+enum PtyInput {
+    Data(Vec<u8>),
+    Close,
+}
+
+enum PtyOutput {
+    Data(Vec<u8>),
+    Eof,
+    Error(String),
 }
 
 #[tokio::main]
@@ -209,8 +224,12 @@ async fn handle_request(
             };
             write_json_frame(&mut stream, FrameKind::Response, request_id, &response).await?;
         }
-        ControlRequest::Push { path, mode } => {
-            if let Err(err) = handle_push(&mut stream, request_id, &path, mode).await {
+        ControlRequest::Push {
+            path,
+            mode,
+            source_name,
+        } => {
+            if let Err(err) = handle_push(&mut stream, request_id, &path, mode, source_name).await {
                 send_error(&mut stream, request_id, ErrorCode::FileTransferFailed, err).await?;
             }
         }
@@ -225,8 +244,17 @@ async fn handle_request(
                 send_error(&mut stream, request_id, code, err).await?;
             }
         }
-        ControlRequest::Shell { command, args } => {
-            if let Err(err) = handle_shell(stream, request_id, command, args).await {
+        ControlRequest::Shell {
+            command,
+            args,
+            pty,
+            term,
+            rows,
+            cols,
+        } => {
+            if let Err(err) =
+                handle_shell(stream, request_id, command, args, pty, term, rows, cols).await
+            {
                 return Err(err);
             }
         }
@@ -245,6 +273,7 @@ fn capabilities() -> CapabilitySet {
             "capability".to_string(),
             "shell.exec".to_string(),
             "shell.interactive".to_string(),
+            "shell.pty".to_string(),
             "fs.push".to_string(),
             "fs.pull".to_string(),
         ],
@@ -281,16 +310,25 @@ async fn execute_command(
     })
 }
 
-async fn handle_push(stream: &mut TcpStream, request_id: u32, path: &str, mode: u32) -> Result<()> {
+async fn handle_push(
+    stream: &mut TcpStream,
+    request_id: u32,
+    path: &str,
+    mode: u32,
+    source_name: Option<String>,
+) -> Result<()> {
+    let resolved_path = resolve_push_destination(path, source_name.as_deref()).await?;
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     options.mode(normalize_mode(mode));
 
-    let mut file = options
-        .open(path)
-        .await
-        .with_context(|| format!("failed to open remote path for write: {path}"))?;
+    let mut file = options.open(&resolved_path).await.with_context(|| {
+        format!(
+            "failed to open remote path for write: {}",
+            resolved_path.display()
+        )
+    })?;
     write_json_frame(
         stream,
         FrameKind::Response,
@@ -318,9 +356,12 @@ async fn handle_push(stream: &mut TcpStream, request_id: u32, path: &str, mode: 
     file.flush().await?;
     #[cfg(unix)]
     if mode != 0 {
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(normalize_mode(mode)))
-            .await
-            .with_context(|| format!("failed to set permissions on {path}"))?;
+        tokio::fs::set_permissions(
+            &resolved_path,
+            std::fs::Permissions::from_mode(normalize_mode(mode)),
+        )
+        .await
+        .with_context(|| format!("failed to set permissions on {}", resolved_path.display()))?;
     }
 
     write_json_frame(
@@ -331,6 +372,34 @@ async fn handle_push(stream: &mut TcpStream, request_id: u32, path: &str, mode: 
     )
     .await?;
     Ok(())
+}
+
+async fn resolve_push_destination(path: &str, source_name: Option<&str>) -> Result<PathBuf> {
+    let requested = PathBuf::from(path);
+    if requested.as_os_str().is_empty() {
+        bail!("remote path must not be empty");
+    }
+
+    let remote_metadata = match metadata(&requested).await {
+        Ok(metadata) => Some(metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err).with_context(|| format!("failed to stat remote path: {path}")),
+    };
+
+    if remote_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.is_dir())
+        || path.ends_with('/')
+    {
+        let file_name = source_name
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow!("remote path refers to a directory but source file name is missing")
+            })?;
+        return Ok(requested.join(file_name));
+    }
+
+    Ok(requested)
 }
 
 async fn handle_pull(stream: &mut TcpStream, request_id: u32, path: &str) -> Result<()> {
@@ -392,8 +461,25 @@ async fn handle_shell(
     request_id: u32,
     command: Option<String>,
     args: Vec<String>,
+    pty: bool,
+    term: Option<String>,
+    rows: Option<u16>,
+    cols: Option<u16>,
 ) -> Result<()> {
-    let (display_command, mut child) = spawn_shell(command, args)?;
+    if pty {
+        return handle_pty_shell(stream, request_id, command, args, term, rows, cols).await;
+    }
+
+    handle_pipe_shell(stream, request_id, command, args).await
+}
+
+async fn handle_pipe_shell(
+    stream: TcpStream,
+    request_id: u32,
+    command: Option<String>,
+    args: Vec<String>,
+) -> Result<()> {
+    let (display_command, mut child) = spawn_pipe_shell(command, args)?;
     let (mut reader, mut writer) = stream.into_split();
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(32);
     tokio::spawn(async move {
@@ -531,7 +617,131 @@ async fn handle_shell(
     Ok(())
 }
 
-fn spawn_shell(
+async fn handle_pty_shell(
+    stream: TcpStream,
+    request_id: u32,
+    command: Option<String>,
+    args: Vec<String>,
+    term: Option<String>,
+    rows: Option<u16>,
+    cols: Option<u16>,
+) -> Result<()> {
+    let (display_command, mut child, controller) =
+        spawn_pty_shell(command, args, term, rows, cols)?;
+    let (mut reader, mut writer) = stream.into_split();
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(32);
+    tokio::spawn(async move {
+        loop {
+            let frame = read_frame(&mut reader).await;
+            let should_stop = frame.is_err();
+            if frame_tx.send(frame).await.is_err() {
+                break;
+            }
+            if should_stop {
+                break;
+            }
+        }
+    });
+    write_json_frame(
+        &mut writer,
+        FrameKind::Response,
+        request_id,
+        &ControlResponse::ShellStarted {
+            command: display_command,
+        },
+    )
+    .await?;
+
+    let controller_reader = controller
+        .try_clone()
+        .context("failed to clone PTY controller for output")?;
+    let (pty_output_tx, mut pty_output_rx) = tokio::sync::mpsc::channel(32);
+    start_pty_output_pump(controller_reader, pty_output_tx);
+
+    let (pty_input_tx, pty_input_rx) = tokio::sync::mpsc::channel(32);
+    start_pty_input_pump(controller, pty_input_rx);
+    let mut pty_input_tx = Some(pty_input_tx);
+    let mut stdin_open = true;
+    let mut stdout_open = true;
+    let mut wait = Box::pin(child.wait());
+    let mut exit_status = None;
+
+    while stdout_open || exit_status.is_none() {
+        tokio::select! {
+            frame = frame_rx.recv(), if stdin_open => {
+                match frame {
+                    Some(Ok(frame)) => {
+                        let chunk = decode_stream_frame(&frame)?;
+                        expect_stream_chunk(&chunk, request_id, StreamChannel::Stdin)?;
+                        if !chunk.payload.is_empty() {
+                            if let Some(tx) = &pty_input_tx {
+                                tx.send(PtyInput::Data(chunk.payload)).await
+                                    .context("failed to forward PTY stdin chunk")?;
+                            }
+                        }
+                        if chunk.eof {
+                            if let Some(tx) = pty_input_tx.take() {
+                                let _ = tx.send(PtyInput::Close).await;
+                            }
+                            stdin_open = false;
+                        }
+                    }
+                    Some(Err(ProtocolError::Io(err))) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        if let Some(tx) = pty_input_tx.take() {
+                            let _ = tx.send(PtyInput::Close).await;
+                        }
+                        stdin_open = false;
+                    }
+                    Some(Err(err)) => return Err(err.into()),
+                    None => {
+                        if let Some(tx) = pty_input_tx.take() {
+                            let _ = tx.send(PtyInput::Close).await;
+                        }
+                        stdin_open = false;
+                    }
+                }
+            }
+            output = pty_output_rx.recv(), if stdout_open => {
+                match output {
+                    Some(PtyOutput::Data(data)) => {
+                        write_stream_frame(
+                            &mut writer,
+                            request_id,
+                            StreamChannel::Stdout,
+                            false,
+                            &data,
+                        )
+                        .await?;
+                    }
+                    Some(PtyOutput::Eof) | None => {
+                        stdout_open = false;
+                        write_stream_frame(&mut writer, request_id, StreamChannel::Stdout, true, &[]).await?;
+                    }
+                    Some(PtyOutput::Error(message)) => {
+                        return Err(anyhow!("PTY stream failed: {message}"));
+                    }
+                }
+            }
+            status = &mut wait, if exit_status.is_none() => {
+                exit_status = Some(status.context("failed to wait for shell process")?);
+            }
+        }
+    }
+
+    let status = exit_status.ok_or_else(|| anyhow!("shell process ended without exit status"))?;
+    write_json_frame(
+        &mut writer,
+        FrameKind::Response,
+        request_id,
+        &ControlResponse::ShellExit {
+            status: status.code().unwrap_or(-1),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+fn spawn_pipe_shell(
     command: Option<String>,
     args: Vec<String>,
 ) -> Result<(String, tokio::process::Child)> {
@@ -561,8 +771,144 @@ fn spawn_shell(
     Ok((display_command, child))
 }
 
+fn spawn_pty_shell(
+    command: Option<String>,
+    args: Vec<String>,
+    term: Option<String>,
+    rows: Option<u16>,
+    cols: Option<u16>,
+) -> Result<(String, tokio::process::Child, StdFile)> {
+    let shell = default_shell();
+    let (display_command, program, argv) = match command {
+        Some(command) if !command.trim().is_empty() => {
+            let command_line = join_shell_command(&command, &args);
+            (
+                format!("{shell} -c {command_line}"),
+                shell.clone(),
+                vec!["-c".to_string(), command_line],
+            )
+        }
+        Some(_) => bail!("shell command must not be empty"),
+        None => (format!("{shell} -i"), shell.clone(), vec!["-i".to_string()]),
+    };
+
+    let winsize = shell_winsize(rows, cols);
+    let pty = openpty(None, winsize.as_ref()).context("failed to allocate PTY")?;
+    let controller = StdFile::from(pty.controller);
+    let mut user = Some(pty.user);
+
+    let mut child = Command::new(&program);
+    child.args(&argv);
+    if let Some(term) = term.filter(|value| !value.trim().is_empty()) {
+        child.env("TERM", term);
+    }
+    // SAFETY: `login_tty` is run in the post-fork child process immediately before `exec`.
+    unsafe {
+        child.pre_exec(move || {
+            let user = user
+                .take()
+                .ok_or_else(|| std::io::Error::other("PTY slave already consumed"))?;
+            login_tty(user).map_err(std::io::Error::from)?;
+            Ok(())
+        });
+    }
+
+    let child = child
+        .spawn()
+        .with_context(|| format!("failed to spawn PTY shell command: {program}"))?;
+    Ok((display_command, child, controller))
+}
+
+fn start_pty_output_pump(mut controller: StdFile, tx: tokio::sync::mpsc::Sender<PtyOutput>) {
+    std::thread::spawn(move || {
+        let mut buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
+        loop {
+            match std::io::Read::read(&mut controller, &mut buffer) {
+                Ok(0) => {
+                    let _ = tx.blocking_send(PtyOutput::Eof);
+                    break;
+                }
+                Ok(read) => {
+                    if tx
+                        .blocking_send(PtyOutput::Data(buffer[..read].to_vec()))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(err) if is_pty_closed_error(&err) => {
+                    let _ = tx.blocking_send(PtyOutput::Eof);
+                    break;
+                }
+                Err(err) => {
+                    let _ = tx.blocking_send(PtyOutput::Error(err.to_string()));
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn start_pty_input_pump(mut controller: StdFile, mut rx: tokio::sync::mpsc::Receiver<PtyInput>) {
+    std::thread::spawn(move || {
+        while let Some(input) = rx.blocking_recv() {
+            match input {
+                PtyInput::Data(data) => {
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if let Err(err) = std::io::Write::write_all(&mut controller, &data) {
+                        if !is_pty_closed_error(&err) {
+                            trace!(error = %err, "PTY input pump stopped");
+                        }
+                        break;
+                    }
+                }
+                PtyInput::Close => break,
+            }
+        }
+    });
+}
+
+fn shell_winsize(rows: Option<u16>, cols: Option<u16>) -> Option<Winsize> {
+    match (
+        rows.filter(|value| *value > 0),
+        cols.filter(|value| *value > 0),
+    ) {
+        (Some(rows), Some(cols)) => Some(Winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }),
+        _ => None,
+    }
+}
+
+fn is_pty_closed_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::UnexpectedEof
+    ) || err.raw_os_error() == Some(5)
+}
+
 fn default_shell() -> String {
-    std::env::var("RSDB_DEFAULT_SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+    if let Some(shell) = std::env::var("RSDB_DEFAULT_SHELL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return shell;
+    }
+
+    for candidate in ["/bin/bash", "/usr/bin/bash", "/bin/sh", "/usr/bin/sh"] {
+        if std::fs::metadata(candidate).is_ok() {
+            return candidate.to_string();
+        }
+    }
+
+    "/bin/sh".to_string()
 }
 
 fn join_shell_command(command: &str, args: &[String]) -> String {

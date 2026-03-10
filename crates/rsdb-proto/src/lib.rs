@@ -168,6 +168,8 @@ pub enum ControlRequest {
     Push {
         path: String,
         mode: u32,
+        #[serde(default)]
+        source_name: Option<String>,
     },
     Pull {
         path: String,
@@ -175,6 +177,14 @@ pub enum ControlRequest {
     Shell {
         command: Option<String>,
         args: Vec<String>,
+        #[serde(default)]
+        pty: bool,
+        #[serde(default)]
+        term: Option<String>,
+        #[serde(default)]
+        rows: Option<u16>,
+        #[serde(default)]
+        cols: Option<u16>,
     },
 }
 

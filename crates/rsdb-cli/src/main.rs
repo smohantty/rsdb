@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::IsTerminal as _;
 use std::io::Read as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
 use rsdb_proto::{
     CapabilitySet, ControlRequest, ControlResponse, DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest,
     DiscoveryResponse, FrameKind, MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION, StreamChannel,
@@ -26,6 +28,16 @@ use tokio::time::timeout;
 use tracing::{debug, trace};
 
 const REQUEST_ID: u32 = 1;
+
+struct RawModeGuard(bool);
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = disable_raw_mode();
+        }
+    }
+}
 
 enum StdinChunk {
     Data(Vec<u8>),
@@ -388,6 +400,10 @@ async fn push_command(target: Option<&str>, local_path: &Path, remote_path: &str
     }
 
     let mode = local_file_mode(&metadata);
+    let source_name = local_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow!("local path has no file name: {}", local_path.display()))?;
     let mut file = File::open(local_path)
         .await
         .with_context(|| format!("failed to open local file {}", local_path.display()))?;
@@ -400,6 +416,7 @@ async fn push_command(target: Option<&str>, local_path: &Path, remote_path: &str
         &ControlRequest::Push {
             path: remote_path.to_string(),
             mode,
+            source_name: Some(source_name),
         },
     )
     .await
@@ -543,11 +560,23 @@ async fn run_shell_session(
     interactive: bool,
 ) -> Result<()> {
     let mut stream = open_connection(addr).await?;
+    let term = interactive.then(remote_term);
+    let (rows, cols) = interactive
+        .then(remote_terminal_size)
+        .transpose()?
+        .unwrap_or((None, None));
     write_json_frame(
         &mut stream,
         FrameKind::Request,
         REQUEST_ID,
-        &ControlRequest::Shell { command, args },
+        &ControlRequest::Shell {
+            command,
+            args,
+            pty: interactive,
+            term,
+            rows,
+            cols,
+        },
     )
     .await
     .context("failed to send shell request")?;
@@ -578,6 +607,7 @@ async fn run_shell_session(
     let mut stderr = tokio::io::stderr();
     let mut stdin_open = interactive;
     let mut stdin_rx = interactive.then(start_stdin_pump);
+    let _raw_mode = interactive.then(enable_local_raw_mode).transpose()?;
 
     if !interactive {
         write_stream_frame(&mut writer, REQUEST_ID, StreamChannel::Stdin, true, &[])
@@ -600,20 +630,6 @@ async fn run_shell_session(
                         )
                         .await
                         .context("failed to forward stdin")?;
-                        if should_close_stdin_after_chunk(&data) {
-                            trace!("closing shell stdin after exit/logout command");
-                            write_stream_frame(
-                                &mut writer,
-                                REQUEST_ID,
-                                StreamChannel::Stdin,
-                                true,
-                                &[],
-                            )
-                            .await
-                            .context("failed to finish stdin stream")?;
-                            stdin_open = false;
-                            stdin_rx = None;
-                        }
                     }
                     Some(StdinChunk::Eof) | None => {
                         trace!("forwarding shell stdin eof");
@@ -662,7 +678,7 @@ async fn run_shell_session(
                             ControlResponse::ShellExit { status } => {
                                 stdout.flush().await?;
                                 stderr.flush().await?;
-                                if status != 0 {
+                                if !interactive && status != 0 {
                                     bail!("remote shell exited with status {status}");
                                 }
                                 return Ok(());
@@ -718,11 +734,29 @@ async fn recv_stdin_chunk(stdin_rx: &mut Option<mpsc::Receiver<StdinChunk>>) -> 
     }
 }
 
-fn should_close_stdin_after_chunk(data: &[u8]) -> bool {
-    std::str::from_utf8(data)
+fn enable_local_raw_mode() -> Result<RawModeGuard> {
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        enable_raw_mode().context("failed to enable raw terminal mode")?;
+        Ok(RawModeGuard(true))
+    } else {
+        Ok(RawModeGuard(false))
+    }
+}
+
+fn remote_term() -> String {
+    env::var("TERM")
         .ok()
-        .map(str::trim)
-        .is_some_and(|line| matches!(line, "exit" | "logout"))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "xterm-256color".to_string())
+}
+
+fn remote_terminal_size() -> Result<(Option<u16>, Option<u16>)> {
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        let (cols, rows) = terminal_size().context("failed to read local terminal size")?;
+        Ok((Some(rows), Some(cols)))
+    } else {
+        Ok((None, None))
+    }
 }
 
 fn print_capability(addr: &str, server_id: &str, capability: &CapabilitySet) -> Result<()> {
