@@ -1,0 +1,9 @@
+[Unit]
+Description=RSDB TCP socket
+
+[Socket]
+ListenStream=27101
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target
