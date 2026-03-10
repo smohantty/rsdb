@@ -237,9 +237,33 @@ async fn discover_targets(
     port: u16,
     timeout_ms: u64,
 ) -> Result<Vec<DiscoveredTarget>> {
+    let mut discovered = BTreeMap::<String, DiscoveredTarget>::new();
+    for probe_ip in discovery_probe_addresses(probe_addr)? {
+        for target in discover_targets_once(probe_ip, port, timeout_ms).await? {
+            let key = format!("{}@{}", target.server_id, target.addr);
+            discovered.insert(key, target);
+        }
+    }
+
+    Ok(discovered.into_values().collect())
+}
+
+fn discovery_probe_addresses(probe_addr: &str) -> Result<Vec<IpAddr>> {
     let probe_ip: IpAddr = probe_addr
         .parse()
         .with_context(|| format!("invalid probe address: {probe_addr}"))?;
+    let mut addresses = vec![probe_ip];
+    if probe_ip == IpAddr::V4(std::net::Ipv4Addr::BROADCAST) {
+        addresses.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    }
+    Ok(addresses)
+}
+
+async fn discover_targets_once(
+    probe_ip: IpAddr,
+    port: u16,
+    timeout_ms: u64,
+) -> Result<Vec<DiscoveredTarget>> {
     let bind_addr = match probe_ip {
         IpAddr::V4(_) => "0.0.0.0:0",
         IpAddr::V6(_) => "[::]:0",
