@@ -18,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::process::Command;
 use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::{debug, trace};
 
 #[derive(Debug, Parser)]
 #[command(name = "rsdbd")]
@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     let discovery_socket = UdpSocket::bind(listen_addr)
         .await
         .with_context(|| format!("failed to bind discovery socket on {listen_addr}"))?;
-    info!(
+    debug!(
         listen = %listen_addr,
         server_id = %state.server_id,
         discovery = %listen_addr,
@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
     let discovery_state = state.clone();
     tokio::spawn(async move {
         if let Err(err) = handle_discovery(discovery_socket, discovery_state).await {
-            warn!(error = %err, "discovery socket stopped");
+            debug!(error = %err, "discovery socket stopped");
         }
     });
 
@@ -79,15 +79,15 @@ async fn main() -> Result<()> {
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_connection(stream, state).await {
-                warn!(peer = %peer, error = %err, "connection closed with error");
+                debug!(peer = %peer, error = %err, "connection closed with error");
             }
         });
     }
 }
 
 fn init_tracing() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info,rsdbd=debug".into());
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "off".into());
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -126,7 +126,7 @@ async fn handle_discovery(socket: UdpSocket, state: ServerState) -> Result<()> {
             Ok(request) => request,
             Err(ProtocolError::InvalidDiscoveryMagic) => continue,
             Err(err) => {
-                warn!(peer = %peer, error = %err, "invalid discovery request");
+                trace!(peer = %peer, error = %err, "invalid discovery request");
                 continue;
             }
         };
