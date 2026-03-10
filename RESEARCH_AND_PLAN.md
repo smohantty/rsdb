@@ -137,7 +137,6 @@ This is the only option that can realistically become a full `sdb` replacement:
 - full filesystem access
 - app/package lifecycle hooks
 - root or elevated operations
-- systemd socket activation
 
 This matches how official `sdbd` is packaged and launched.
 
@@ -280,7 +279,6 @@ Recommended device responsibilities:
 Recommended device integration:
 
 - `rsdbd.service` under `systemd`
-- optional `rsdbd.socket` if you want socket activation
 - optional USB gadget network setup service if you use USB Ethernet
 
 USB strategies if you own firmware:
@@ -549,7 +547,6 @@ rsdb/
   packaging/
     systemd/
       rsdbd.service
-      rsdbd.socket
     usb/
       gadget-network.sh
       gadget-bulk.sh
