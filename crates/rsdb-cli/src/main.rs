@@ -50,7 +50,7 @@ enum Commands {
         name: Option<String>,
     },
     Disconnect {
-        name: String,
+        name: Option<String>,
     },
     Devices,
     Discover {
@@ -89,15 +89,17 @@ enum Commands {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredTarget {
     name: String,
     addr: String,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 struct Registry {
     targets: Vec<StoredTarget>,
+    current_target: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,7 +118,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Connect { addr, name } => connect_command(&addr, name.as_deref()).await,
-        Commands::Disconnect { name } => disconnect_command(&name),
+        Commands::Disconnect { name } => disconnect_command(name.as_deref()),
         Commands::Devices => devices_command().await,
         Commands::Discover {
             probe_addr,
@@ -166,48 +168,55 @@ async fn connect_command(addr: &str, requested_name: Option<&str>) -> Result<()>
         );
     }
 
-    let mut registry = load_registry()?;
     let name = requested_name
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| default_name(addr));
-    registry.targets.retain(|entry| entry.name != name);
-    registry.targets.push(StoredTarget {
-        name: name.clone(),
-        addr: addr.to_string(),
-    });
+    let registry = Registry {
+        targets: vec![StoredTarget {
+            name: name.clone(),
+            addr: addr.to_string(),
+        }],
+        current_target: Some(name.clone()),
+    };
     save_registry(&registry)?;
 
     println!("connected {name} -> {addr} ({server_id})");
     Ok(())
 }
 
-fn disconnect_command(name: &str) -> Result<()> {
+fn disconnect_command(name: Option<&str>) -> Result<()> {
     let mut registry = load_registry()?;
-    let before = registry.targets.len();
-    registry.targets.retain(|entry| entry.name != name);
-    if registry.targets.len() == before {
+    let Some(target) = primary_target(&registry) else {
+        bail!("no saved targets; use `rsdb connect <addr>` first");
+    };
+
+    if let Some(name) = name
+        && target.name != name
+    {
         bail!("no saved target named {name}");
     }
+
+    let disconnected = target.name.to_string();
+    registry.targets.clear();
+    registry.current_target = None;
     save_registry(&registry)?;
-    println!("disconnected {name}");
+    println!("disconnected {disconnected}");
     Ok(())
 }
 
 async fn devices_command() -> Result<()> {
     let registry = load_registry()?;
-    if registry.targets.is_empty() {
+    let Some(target) = primary_target(&registry).cloned() else {
         println!("no saved devices");
         return Ok(());
-    }
+    };
 
-    for target in registry.targets {
-        let status = match request(&target.addr, ControlRequest::Ping).await {
-            Ok(ControlResponse::Pong { server_id, .. }) => format!("online ({server_id})"),
-            Ok(other) => format!("unexpected ({other:?})"),
-            Err(err) => format!("offline ({err})"),
-        };
-        println!("{}\t{}\t{}", target.name, target.addr, status);
-    }
+    let status = match request(&target.addr, ControlRequest::Ping).await {
+        Ok(ControlResponse::Pong { server_id, .. }) => format!("online ({server_id})"),
+        Ok(other) => format!("unexpected ({other:?})"),
+        Err(err) => format!("offline ({err})"),
+    };
+    println!("{}\t{}\t{}", target.name, target.addr, status);
     Ok(())
 }
 
@@ -780,20 +789,30 @@ fn resolve_target(input: Option<&str>) -> Result<String> {
         }
 
         let registry = load_registry()?;
-        let target = registry
-            .targets
-            .iter()
-            .find(|entry| entry.name == value)
-            .ok_or_else(|| anyhow!("no saved target named {value}"))?;
+        let target = primary_target(&registry).ok_or_else(|| anyhow!("no saved targets"))?;
+        if target.name != value {
+            bail!("no saved target named {value}");
+        }
         return Ok(target.addr.clone());
     }
 
     let registry = load_registry()?;
-    match registry.targets.as_slice() {
-        [only] => Ok(only.addr.clone()),
-        [] => bail!("no saved targets; use `rsdb connect <addr>` first"),
-        _ => bail!("multiple saved targets; pass `--target <name>`"),
+    primary_target(&registry)
+        .map(|target| target.addr.clone())
+        .ok_or_else(|| anyhow!("no saved targets; use `rsdb connect <addr>` first"))
+}
+
+fn primary_target(registry: &Registry) -> Option<&StoredTarget> {
+    if let Some(current_name) = registry.current_target.as_deref()
+        && let Some(target) = registry
+            .targets
+            .iter()
+            .find(|entry| entry.name == current_name)
+    {
+        return Some(target);
     }
+
+    registry.targets.last()
 }
 
 fn load_registry() -> Result<Registry> {
@@ -804,22 +823,38 @@ fn load_registry() -> Result<Registry> {
 
     let contents = fs::read_to_string(&path)
         .with_context(|| format!("failed to read registry file {}", path.display()))?;
-    let registry =
+    let registry: Registry =
         serde_json::from_str(&contents).with_context(|| format!("invalid {}", path.display()))?;
-    Ok(registry)
+    let normalized = normalize_registry(registry.clone());
+    if normalized != registry {
+        write_registry(&path, &normalized)?;
+    }
+    Ok(normalized)
 }
 
 fn save_registry(registry: &Registry) -> Result<()> {
     let path = registry_path()?;
+    let registry = normalize_registry(registry.clone());
+    write_registry(&path, &registry)
+}
+
+fn write_registry(path: &Path, registry: &Registry) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("registry path has no parent: {}", path.display()))?;
     fs::create_dir_all(parent)
         .with_context(|| format!("failed to create config dir {}", parent.display()))?;
-    let contents = serde_json::to_string_pretty(registry)?;
+    let contents = serde_json::to_string_pretty(&registry)?;
     fs::write(&path, contents)
         .with_context(|| format!("failed to write registry file {}", path.display()))?;
     Ok(())
+}
+
+fn normalize_registry(mut registry: Registry) -> Registry {
+    let target = primary_target(&registry).cloned();
+    registry.targets = target.into_iter().collect();
+    registry.current_target = registry.targets.first().map(|entry| entry.name.clone());
+    registry
 }
 
 fn registry_path() -> Result<PathBuf> {
