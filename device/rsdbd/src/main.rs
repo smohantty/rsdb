@@ -142,6 +142,9 @@ async fn main() -> Result<()> {
 
     loop {
         let (stream, peer) = listener.accept().await.context("accept failed")?;
+        if let Err(err) = stream.set_nodelay(true) {
+            warn!(peer = %peer, error = %err, "failed to set TCP_NODELAY");
+        }
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_connection(stream, state).await {
@@ -1117,7 +1120,8 @@ async fn handle_pipe_shell(
     state: &ServerState,
 ) -> Result<()> {
     let (display_command, mut child) = spawn_pipe_shell(command, args, &state.shell_path)?;
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, writer) = stream.into_split();
+    let mut writer = tokio::io::BufWriter::new(writer);
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(32);
     tokio::spawn(async move {
         loop {
@@ -1260,7 +1264,8 @@ async fn handle_pty_shell(
 ) -> Result<()> {
     let (display_command, mut child, controller) =
         spawn_pty_shell(command, args, term, rows, cols, &state.shell_path)?;
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, writer) = stream.into_split();
+    let mut writer = tokio::io::BufWriter::new(writer);
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(32);
     tokio::spawn(async move {
         loop {
