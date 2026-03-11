@@ -62,7 +62,8 @@ enum Commands {
         name: Option<String>,
     },
     Disconnect {
-        name: Option<String>,
+        #[arg(value_name = "ADDR")]
+        target: Option<String>,
     },
     Devices,
     Discover {
@@ -74,27 +75,27 @@ enum Commands {
         timeout_ms: u64,
     },
     Ping {
-        #[arg(long)]
+        #[arg(long, value_name = "ADDR")]
         target: Option<String>,
     },
     Capability {
-        #[arg(long)]
+        #[arg(long, value_name = "ADDR")]
         target: Option<String>,
     },
     Shell {
-        #[arg(long)]
+        #[arg(long, value_name = "ADDR")]
         target: Option<String>,
         #[arg(allow_hyphen_values = true)]
         command: Vec<String>,
     },
     Push {
-        #[arg(long)]
+        #[arg(long, value_name = "ADDR")]
         target: Option<String>,
         local_path: PathBuf,
         remote_path: String,
     },
     Pull {
-        #[arg(long)]
+        #[arg(long, value_name = "ADDR")]
         target: Option<String>,
         remote_path: String,
         local_path: PathBuf,
@@ -119,6 +120,7 @@ struct DiscoveredTarget {
     device_name: String,
     addr: SocketAddr,
     platform: String,
+    protocol_version: u16,
 }
 
 #[tokio::main]
@@ -128,7 +130,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Connect { addr, name } => connect_command(&addr, name.as_deref()).await,
-        Commands::Disconnect { name } => disconnect_command(name.as_deref()),
+        Commands::Disconnect { target } => disconnect_command(target.as_deref()),
         Commands::Devices => devices_command().await,
         Commands::Discover {
             probe_addr,
@@ -163,57 +165,75 @@ fn init_tracing() {
 
 async fn connect_command(addr: &str, requested_name: Option<&str>) -> Result<()> {
     let addr = normalize_connect_addr(addr);
+    let discovered = discover_target_at(&addr, 500).await.ok().flatten();
+    if let Some(warning) = discovered
+        .as_ref()
+        .and_then(|target| protocol_warning_text(target.protocol_version))
+    {
+        eprintln!(
+            "warning: {warning}; commands may fail until rsdb and rsdbd are updated together"
+        );
+    }
     let response = request(&addr, ControlRequest::Ping).await?;
-    let (server_id, protocol_version) = match response {
+    let protocol_version = match response {
         ControlResponse::Pong {
-            server_id,
-            protocol_version,
-        } => (server_id, protocol_version),
+            protocol_version, ..
+        } => protocol_version,
         other => bail!("unexpected response from daemon: {other:?}"),
     };
 
     if protocol_version != PROTOCOL_VERSION {
-        bail!(
-            "protocol version mismatch: host={} daemon={protocol_version}",
-            PROTOCOL_VERSION
+        eprintln!(
+            "warning: {}; commands may fail until rsdb and rsdbd are updated together",
+            protocol_warning_label(protocol_version)
         );
     }
 
+    let mut registry = load_registry()?;
+    let existing_target = registry.targets.iter().find(|target| target.addr == addr);
     let name = if let Some(name) = requested_name {
         name.to_owned()
+    } else if let Some(target) =
+        existing_target.filter(|target| !is_legacy_auto_name(&target.name, &addr))
+    {
+        target.name.clone()
+    } else if let Some(target) = discovered
+        .as_ref()
+        .filter(|target| !target.device_name.trim().is_empty())
+    {
+        target.device_name.clone()
     } else {
-        discovered_device_name(&addr, 500)
-            .await
-            .unwrap_or_else(|| default_name(&addr))
+        default_name(&addr)
     };
-    let registry = Registry {
-        targets: vec![StoredTarget {
-            name: name.clone(),
-            addr: addr.clone(),
-        }],
-        current_target: Some(name.clone()),
-    };
+    registry.targets.retain(|target| target.addr != addr);
+    registry.targets.push(StoredTarget {
+        name: name.clone(),
+        addr: addr.clone(),
+    });
+    registry.current_target = Some(addr.clone());
     save_registry(&registry)?;
 
-    println!("connected {name} -> {addr} ({server_id})");
+    println!("connected {name} -> {}", display_addr(&addr));
     Ok(())
 }
 
 fn disconnect_command(name: Option<&str>) -> Result<()> {
     let mut registry = load_registry()?;
-    let Some(target) = primary_target(&registry) else {
-        bail!("no saved targets; use `rsdb connect <addr>` first");
-    };
-
-    if let Some(name) = name
-        && target.name != name
-    {
-        bail!("no saved target named {name}");
+    let index = if let Some(selector) = name {
+        find_target_index_by_addr(&registry, selector)?
+    } else {
+        primary_target_index(&registry)
     }
-
+    .ok_or_else(|| anyhow!("no saved targets; use `rsdb connect <addr>` first"))?;
+    let target = registry.targets.remove(index);
     let disconnected = target.name.to_string();
-    registry.targets.clear();
-    registry.current_target = None;
+    if registry.targets.is_empty() {
+        registry.current_target = None;
+    } else if registry.current_target.as_deref() == Some(&target.addr)
+        || registry.current_target.as_deref() == Some(&target.name)
+    {
+        registry.current_target = registry.targets.last().map(|target| target.addr.clone());
+    }
     save_registry(&registry)?;
     println!("disconnected {disconnected}");
     Ok(())
@@ -221,29 +241,99 @@ fn disconnect_command(name: Option<&str>) -> Result<()> {
 
 async fn devices_command() -> Result<()> {
     let mut registry = load_registry()?;
-    let Some(mut target) = primary_target(&registry).cloned() else {
+    if registry.targets.is_empty() {
         println!("no saved devices");
         return Ok(());
-    };
+    }
+    let current_addr = primary_target(&registry).map(|target| target.addr.clone());
+    let mut rows = Vec::with_capacity(registry.targets.len());
+    let mut changed = false;
 
-    let mut display_name = target.name.clone();
-    if is_legacy_auto_name(&target.name, &target.addr)
-        && let Some(discovered_name) = discovered_device_name(&target.addr, 300).await
-    {
-        display_name = discovered_name.clone();
-        if discovered_name != target.name {
-            target.name = discovered_name.clone();
-            registry.targets = vec![target.clone()];
-            registry.current_target = Some(discovered_name);
-            save_registry(&registry)?;
+    for target in &mut registry.targets {
+        let mut display_name = target.name.clone();
+        let mut platform = "-".to_string();
+        let mut warning = String::new();
+        let status =
+            if let Some(discovered) = discover_target_at(&target.addr, 300).await.ok().flatten() {
+                display_name = discovered.device_name.clone();
+                platform = discovered.platform;
+                warning = protocol_warning_text(discovered.protocol_version).unwrap_or_default();
+                if is_legacy_auto_name(&target.name, &target.addr)
+                    && discovered.device_name != target.name
+                {
+                    target.name = discovered.device_name.clone();
+                    changed = true;
+                }
+                "online".to_string()
+            } else {
+                match request(&target.addr, ControlRequest::Ping).await {
+                    Ok(ControlResponse::Pong { .. }) => "online".to_string(),
+                    Ok(other) => format!("unexpected ({other:?})"),
+                    Err(err) => format!("offline ({err})"),
+                }
+            };
+        rows.push((
+            current_addr.as_deref() == Some(&target.addr),
+            display_name,
+            display_addr(&target.addr),
+            platform,
+            status,
+            warning,
+        ));
+    }
+
+    if changed {
+        save_registry(&registry)?;
+    }
+
+    let name_width = rows
+        .iter()
+        .map(|(_, name, _, _, _, _)| name.len())
+        .max()
+        .unwrap_or(0)
+        .max(4);
+    let addr_width = rows
+        .iter()
+        .map(|(_, _, addr, _, _, _)| addr.len())
+        .max()
+        .unwrap_or(0)
+        .max(7);
+    let platform_width = rows
+        .iter()
+        .map(|(_, _, _, platform, _, _)| platform.len())
+        .max()
+        .unwrap_or(0)
+        .max(8);
+    let warning_width = rows
+        .iter()
+        .map(|(_, _, _, _, _, warning)| warning.len())
+        .max()
+        .unwrap_or(0);
+    if warning_width > 0 {
+        println!(
+            "{:<7}   {:<name_width$}   {:<addr_width$}   {:<platform_width$}   {:<6}   WARNING",
+            "CURRENT", "NAME", "ADDRESS", "PLATFORM", "STATUS",
+        );
+    } else {
+        println!(
+            "{:<7}   {:<name_width$}   {:<addr_width$}   {:<platform_width$}   STATUS",
+            "CURRENT", "NAME", "ADDRESS", "PLATFORM",
+        );
+    }
+    for (is_current, display_name, addr, platform, status, warning) in rows {
+        let current = if is_current { "*" } else { "" };
+        if warning_width > 0 {
+            println!(
+                "{:<7}   {:<name_width$}   {:<addr_width$}   {:<platform_width$}   {:<6}   {}",
+                current, display_name, addr, platform, status, warning,
+            );
+        } else {
+            println!(
+                "{:<7}   {:<name_width$}   {:<addr_width$}   {:<platform_width$}   {}",
+                current, display_name, addr, platform, status,
+            );
         }
     }
-    let status = match request(&target.addr, ControlRequest::Ping).await {
-        Ok(ControlResponse::Pong { server_id, .. }) => format!("online ({server_id})"),
-        Ok(other) => format!("unexpected ({other:?})"),
-        Err(err) => format!("offline ({err})"),
-    };
-    println!("{}\t{}\t{}", display_name, target.addr, status);
     Ok(())
 }
 
@@ -262,19 +352,45 @@ async fn discover_command(probe_addr: &str, port: u16, timeout_ms: u64) -> Resul
         .max(4);
     let addr_width = targets
         .iter()
-        .map(|t| t.addr.to_string().len())
+        .map(|t| display_socket_addr(t.addr).len())
         .max()
         .unwrap_or(0)
         .max(7);
-    println!(
-        "{:<name_width$}   {:<addr_width$}   PLATFORM",
-        "NAME", "ADDRESS",
-    );
-    for target in &targets {
+    let warning_width = targets
+        .iter()
+        .filter_map(|target| protocol_warning_text(target.protocol_version))
+        .map(|warning| warning.len())
+        .max()
+        .unwrap_or(0);
+    if warning_width > 0 {
         println!(
-            "{:<name_width$}   {:<addr_width$}   {}",
-            target.device_name, target.addr, target.platform,
+            "{:<name_width$}   {:<addr_width$}   {:<44}   WARNING",
+            "NAME", "ADDRESS", "PLATFORM",
         );
+    } else {
+        println!(
+            "{:<name_width$}   {:<addr_width$}   PLATFORM",
+            "NAME", "ADDRESS",
+        );
+    }
+    for target in &targets {
+        let warning = protocol_warning_text(target.protocol_version).unwrap_or_default();
+        if warning_width > 0 {
+            println!(
+                "{:<name_width$}   {:<addr_width$}   {:<44}   {}",
+                target.device_name,
+                display_socket_addr(target.addr),
+                target.platform,
+                warning,
+            );
+        } else {
+            println!(
+                "{:<name_width$}   {:<addr_width$}   {}",
+                target.device_name,
+                display_socket_addr(target.addr),
+                target.platform,
+            );
+        }
     }
     Ok(())
 }
@@ -347,17 +463,9 @@ async fn discover_target_at(addr: &str, timeout_ms: u64) -> Result<Option<Discov
             device_name: response.device_name,
             addr: SocketAddr::new(peer.ip(), response.tcp_port),
             platform: response.platform,
+            protocol_version: response.protocol_version,
         }));
     }
-}
-
-async fn discovered_device_name(addr: &str, timeout_ms: u64) -> Option<String> {
-    discover_target_at(addr, timeout_ms)
-        .await
-        .ok()
-        .flatten()
-        .map(|target| target.device_name)
-        .filter(|name| !name.trim().is_empty())
 }
 
 fn discovery_probe_addresses(probe_addr: &str) -> Result<Vec<IpAddr>> {
@@ -432,6 +540,7 @@ async fn discover_targets_once(
                 device_name: response.device_name,
                 addr,
                 platform: response.platform,
+                protocol_version: response.protocol_version,
             },
         );
     }
@@ -450,10 +559,14 @@ async fn ping_command(target: Option<&str>) -> Result<()> {
     let addr = resolve_target(target)?;
     match request(&addr, ControlRequest::Ping).await? {
         ControlResponse::Pong {
-            server_id,
-            protocol_version,
+            protocol_version, ..
         } => {
-            println!("pong\t{addr}\t{server_id}\tprotocol={protocol_version}");
+            println!("pong\t{}\tprotocol={protocol_version}", display_addr(&addr));
+            if let Some(warning) = protocol_warning_text(protocol_version) {
+                eprintln!(
+                    "warning: {warning}; commands may fail until rsdb and rsdbd are updated together"
+                );
+            }
             Ok(())
         }
         other => bail!("unexpected response: {other:?}"),
@@ -928,14 +1041,7 @@ fn ensure_request_id(actual: u32, expected: u32) -> Result<()> {
 
 fn resolve_target(input: Option<&str>) -> Result<String> {
     if let Some(value) = input {
-        let registry = load_registry()?;
-        if let Some(target) = primary_target(&registry)
-            && target.name == value
-        {
-            return Ok(target.addr.clone());
-        }
-
-        return Ok(normalize_connect_addr(value));
+        return normalize_target_addr(value);
     }
 
     let registry = load_registry()?;
@@ -945,16 +1051,41 @@ fn resolve_target(input: Option<&str>) -> Result<String> {
 }
 
 fn primary_target(registry: &Registry) -> Option<&StoredTarget> {
-    if let Some(current_name) = registry.current_target.as_deref()
-        && let Some(target) = registry
+    primary_target_index(registry).map(|index| &registry.targets[index])
+}
+
+fn primary_target_index(registry: &Registry) -> Option<usize> {
+    if let Some(current_target) = registry.current_target.as_deref() {
+        if let Some(index) = registry
             .targets
             .iter()
-            .find(|entry| entry.name == current_name)
-    {
-        return Some(target);
+            .position(|entry| entry.addr == current_target)
+        {
+            return Some(index);
+        }
+
+        if let Some(index) = registry
+            .targets
+            .iter()
+            .position(|entry| entry.name == current_target)
+        {
+            return Some(index);
+        }
     }
 
-    registry.targets.last()
+    registry.targets.len().checked_sub(1)
+}
+
+fn find_target_index_by_addr(registry: &Registry, selector: &str) -> Result<Option<usize>> {
+    let normalized = normalize_target_addr(selector)?;
+    if let Some(index) = registry
+        .targets
+        .iter()
+        .position(|target| target.addr == normalized)
+    {
+        return Ok(Some(index));
+    }
+    Ok(None)
 }
 
 fn load_registry() -> Result<Registry> {
@@ -993,9 +1124,26 @@ fn write_registry(path: &Path, registry: &Registry) -> Result<()> {
 }
 
 fn normalize_registry(mut registry: Registry) -> Registry {
-    let target = primary_target(&registry).cloned();
-    registry.targets = target.into_iter().collect();
-    registry.current_target = registry.targets.first().map(|entry| entry.name.clone());
+    let current_addr = primary_target(&registry).map(|target| target.addr.clone());
+    let mut deduped = Vec::with_capacity(registry.targets.len());
+    for target in registry.targets.drain(..) {
+        if let Some(index) = deduped
+            .iter()
+            .position(|entry: &StoredTarget| entry.addr == target.addr)
+        {
+            deduped.remove(index);
+        }
+        deduped.push(target);
+    }
+    registry.targets = deduped;
+    registry.current_target = current_addr
+        .filter(|current_addr| {
+            registry
+                .targets
+                .iter()
+                .any(|target| target.addr == *current_addr)
+        })
+        .or_else(|| registry.targets.last().map(|target| target.addr.clone()));
     registry
 }
 
@@ -1025,6 +1173,32 @@ fn is_legacy_auto_name(name: &str, addr: &str) -> bool {
     name == default_name(addr)
 }
 
+fn display_addr(addr: &str) -> String {
+    match addr.parse::<SocketAddr>() {
+        Ok(addr) => display_socket_addr(addr),
+        Err(_) => addr.to_string(),
+    }
+}
+
+fn display_socket_addr(addr: SocketAddr) -> String {
+    if addr.port() == DEFAULT_RSDB_PORT {
+        addr.ip().to_string()
+    } else {
+        addr.to_string()
+    }
+}
+
+fn protocol_warning_text(protocol_version: u16) -> Option<String> {
+    (protocol_version != PROTOCOL_VERSION).then(|| protocol_warning_label(protocol_version))
+}
+
+fn protocol_warning_label(protocol_version: u16) -> String {
+    format!(
+        "protocol mismatch (host={} daemon={protocol_version})",
+        PROTOCOL_VERSION
+    )
+}
+
 fn normalize_connect_addr(value: &str) -> String {
     if let Ok(addr) = value.parse::<SocketAddr>() {
         return addr.to_string();
@@ -1039,6 +1213,22 @@ fn normalize_connect_addr(value: &str) -> String {
     }
 
     format!("{value}:{DEFAULT_RSDB_PORT}")
+}
+
+fn normalize_target_addr(value: &str) -> Result<String> {
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Ok(addr.to_string());
+    }
+
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, DEFAULT_RSDB_PORT).to_string());
+    }
+
+    if has_port_suffix(value) {
+        return Ok(value.to_string());
+    }
+
+    bail!("target must be an address like <ip> or <ip>:<port>");
 }
 
 fn has_port_suffix(value: &str) -> bool {
