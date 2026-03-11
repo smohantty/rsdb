@@ -12,6 +12,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 crossterm.workspace = true
+glob.workspace = true
 rsdb-proto = { path = "../rsdb-proto" }
 serde.workspace = true
 serde_json.workspace = true

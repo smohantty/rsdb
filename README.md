@@ -158,17 +158,28 @@ Run a command through the target shell:
 rsdb shell uname -a
 ```
 
-Push a file to the target:
+Push one or more files or folders to the target:
 
 ```bash
 rsdb push ./local.txt /tmp/remote.txt
+rsdb push ./assets ./docs /tmp/remote-root/
+rsdb push ./hello* /tmp/remote-root/
 ```
 
-Pull a file from the target:
+Pull one or more files or folders from the target:
 
 ```bash
 rsdb pull /tmp/remote.txt ./remote.txt
+rsdb pull /tmp/logs ./downloads/
+rsdb pull '/tmp/hello*' ./downloads/
 ```
+
+Notes:
+
+- `push` and `pull` now use `SRC... DEST` syntax
+- directory transfers preserve the source tree recursively, including empty directories
+- when pulling remote wildcards, quote the pattern so your local shell does not expand it first
+- if you pass multiple sources, the destination is treated as a directory root
 
 Ping a target:
 

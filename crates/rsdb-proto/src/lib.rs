@@ -5,9 +5,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAGIC: [u8; 4] = *b"RSDB";
 pub const DISCOVERY_MAGIC: [u8; 8] = *b"RSDBDISC";
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const HEADER_LEN: usize = 24;
-pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
+pub const MAX_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 pub const MAX_DISCOVERY_PAYLOAD_LEN: usize = 16 * 1024;
 pub const STREAM_EOF_FLAG: u32 = 1 << 31;
 pub const STREAM_CHANNEL_MASK: u32 = 0xff;
@@ -158,6 +158,29 @@ pub enum ErrorCode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferEntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransferRoot {
+    pub source_name: String,
+    pub kind: TransferEntryKind,
+    pub mode: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransferEntry {
+    pub root_index: u32,
+    pub relative_path: String,
+    pub kind: TransferEntryKind,
+    pub mode: u32,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlRequest {
     Ping,
@@ -174,6 +197,14 @@ pub enum ControlRequest {
     },
     Pull {
         path: String,
+    },
+    PushBatch {
+        destination: String,
+        roots: Vec<TransferRoot>,
+        entries: Vec<TransferEntry>,
+    },
+    PullBatch {
+        sources: Vec<String>,
     },
     Shell {
         command: Option<String>,
@@ -214,6 +245,20 @@ pub enum ControlResponse {
         mode: u32,
     },
     PullComplete {
+        bytes_sent: u64,
+    },
+    PushBatchReady,
+    PushBatchComplete {
+        entries_written: u64,
+        bytes_written: u64,
+    },
+    PullBatchMetadata {
+        roots: Vec<TransferRoot>,
+        entries: Vec<TransferEntry>,
+        total_bytes: u64,
+    },
+    PullBatchComplete {
+        entries_sent: u64,
         bytes_sent: u64,
     },
     ShellStarted {

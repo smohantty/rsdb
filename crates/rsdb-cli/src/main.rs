@@ -4,7 +4,7 @@ use std::fs;
 use std::io::IsTerminal as _;
 use std::io::Read as _;
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -13,11 +13,13 @@ use std::os::unix::fs::PermissionsExt;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
+use glob::{MatchOptions, glob_with};
 use rsdb_proto::{
     CapabilitySet, ControlRequest, ControlResponse, DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest,
     DiscoveryResponse, FrameKind, MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION, StreamChannel,
-    decode_discovery_message, decode_json, decode_stream_frame, encode_discovery_message,
-    read_frame, write_json_frame, write_stream_frame,
+    TransferEntry, TransferEntryKind, TransferRoot, decode_discovery_message, decode_json,
+    decode_stream_frame, encode_discovery_message, read_frame, write_json_frame,
+    write_stream_frame,
 };
 use serde::{Deserialize, Serialize};
 use tokio::fs::{File, OpenOptions};
@@ -91,14 +93,14 @@ enum Commands {
     Push {
         #[arg(long, value_name = "ADDR")]
         target: Option<String>,
-        local_path: PathBuf,
-        remote_path: String,
+        #[arg(value_name = "PATH", required = true, num_args = 2..)]
+        paths: Vec<String>,
     },
     Pull {
         #[arg(long, value_name = "ADDR")]
         target: Option<String>,
-        remote_path: String,
-        local_path: PathBuf,
+        #[arg(value_name = "PATH", required = true, num_args = 2..)]
+        paths: Vec<String>,
     },
 }
 
@@ -123,6 +125,20 @@ struct DiscoveredTarget {
     protocol_version: u16,
 }
 
+#[derive(Debug, Clone)]
+struct LocalBatchFile {
+    path: PathBuf,
+    size: u64,
+}
+
+#[derive(Debug, Clone)]
+struct LocalBatchManifest {
+    roots: Vec<TransferRoot>,
+    entries: Vec<TransferEntry>,
+    files: Vec<LocalBatchFile>,
+    total_bytes: u64,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -140,16 +156,14 @@ async fn main() -> Result<()> {
         Commands::Ping { target } => ping_command(target.as_deref()).await,
         Commands::Capability { target } => capability_command(target.as_deref()).await,
         Commands::Shell { target, command } => shell_command(target.as_deref(), &command).await,
-        Commands::Push {
-            target,
-            local_path,
-            remote_path,
-        } => push_command(target.as_deref(), &local_path, &remote_path).await,
-        Commands::Pull {
-            target,
-            remote_path,
-            local_path,
-        } => pull_command(target.as_deref(), &remote_path, &local_path).await,
+        Commands::Push { target, paths } => {
+            let (sources, destination) = split_sources_and_destination(&paths, "push")?;
+            push_command(target.as_deref(), &sources, &destination).await
+        }
+        Commands::Pull { target, paths } => {
+            let (sources, destination) = split_sources_and_destination(&paths, "pull")?;
+            pull_command(target.as_deref(), &sources, &destination).await
+        }
     }
 }
 
@@ -597,73 +611,60 @@ async fn shell_command(target: Option<&str>, command: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn push_command(target: Option<&str>, local_path: &Path, remote_path: &str) -> Result<()> {
+async fn push_command(
+    target: Option<&str>,
+    source_specs: &[String],
+    remote_path: &str,
+) -> Result<()> {
     let addr = resolve_target(target)?;
-    let metadata = tokio::fs::metadata(local_path)
-        .await
-        .with_context(|| format!("failed to stat local file {}", local_path.display()))?;
-    if !metadata.is_file() {
-        bail!("local path is not a regular file: {}", local_path.display());
-    }
-
-    let mode = local_file_mode(&metadata);
-    let source_name = local_path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .ok_or_else(|| anyhow!("local path has no file name: {}", local_path.display()))?;
-    let mut file = File::open(local_path)
-        .await
-        .with_context(|| format!("failed to open local file {}", local_path.display()))?;
+    let manifest = build_local_batch_manifest(source_specs)?;
     let mut stream = open_connection(&addr).await?;
 
     write_json_frame(
         &mut stream,
         FrameKind::Request,
         REQUEST_ID,
-        &ControlRequest::Push {
-            path: remote_path.to_string(),
-            mode,
-            source_name: Some(source_name),
+        &ControlRequest::PushBatch {
+            destination: remote_path.to_string(),
+            roots: manifest.roots.clone(),
+            entries: manifest.entries.clone(),
         },
     )
     .await
     .context("failed to send push request")?;
 
     match read_response(&mut stream).await? {
-        ControlResponse::PushReady => {}
+        ControlResponse::PushBatchReady => {}
         ControlResponse::Error { code, message } => {
             bail!("remote error {code:?}: {message}");
         }
         other => bail!("unexpected response from daemon: {other:?}"),
     }
 
-    let mut buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
-    loop {
-        let read = file.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        write_stream_frame(
-            &mut stream,
-            REQUEST_ID,
-            StreamChannel::File,
-            false,
-            &buffer[..read],
-        )
-        .await
-        .context("failed to stream file data")?;
+    let bytes_sent = stream_local_batch_files(&mut stream, &manifest.files).await?;
+    if bytes_sent != manifest.total_bytes {
+        bail!(
+            "push size mismatch before completion: expected {} bytes, streamed {bytes_sent}",
+            manifest.total_bytes
+        );
     }
-
     write_stream_frame(&mut stream, REQUEST_ID, StreamChannel::File, true, &[])
         .await
         .context("failed to finish push stream")?;
 
     match read_response(&mut stream).await? {
-        ControlResponse::PushComplete { bytes_written } => {
+        ControlResponse::PushBatchComplete {
+            entries_written,
+            bytes_written,
+        } => {
+            if bytes_written != bytes_sent {
+                bail!("push size mismatch: daemon wrote {bytes_written} bytes, sent {bytes_sent}");
+            }
             println!(
-                "pushed {}\t{}\t{} bytes",
-                local_path.display(),
+                "pushed {}\t{}\t{} entries\t{} bytes",
+                describe_sources(source_specs),
                 remote_path,
+                entries_written,
                 bytes_written
             );
             Ok(())
@@ -675,88 +676,527 @@ async fn push_command(target: Option<&str>, local_path: &Path, remote_path: &str
     }
 }
 
-async fn pull_command(target: Option<&str>, remote_path: &str, local_path: &Path) -> Result<()> {
+async fn pull_command(
+    target: Option<&str>,
+    remote_sources: &[String],
+    local_destination: &str,
+) -> Result<()> {
     let addr = resolve_target(target)?;
     let mut stream = open_connection(&addr).await?;
     write_json_frame(
         &mut stream,
         FrameKind::Request,
         REQUEST_ID,
-        &ControlRequest::Pull {
-            path: remote_path.to_string(),
+        &ControlRequest::PullBatch {
+            sources: remote_sources.to_vec(),
         },
     )
     .await
     .context("failed to send pull request")?;
 
-    let (size, mode) = match read_response(&mut stream).await? {
-        ControlResponse::PullMetadata { size, mode } => (size, mode),
+    let (roots, entries, total_bytes) = match read_response(&mut stream).await? {
+        ControlResponse::PullBatchMetadata {
+            roots,
+            entries,
+            total_bytes,
+        } => (roots, entries, total_bytes),
         ControlResponse::Error { code, message } => {
             bail!("remote error {code:?}: {message}");
         }
         other => bail!("unexpected response from daemon: {other:?}"),
     };
 
-    let mut file = create_local_output_file(local_path, mode).await?;
+    let local_path = PathBuf::from(local_destination);
+    let (entries_received, bytes_received) = receive_local_batch(
+        &mut stream,
+        &local_path,
+        local_destination,
+        &roots,
+        &entries,
+    )
+    .await?;
+
+    match read_response(&mut stream).await? {
+        ControlResponse::PullBatchComplete {
+            entries_sent,
+            bytes_sent,
+        } => {
+            if entries_sent != entries_received {
+                bail!(
+                    "pull entry mismatch: daemon sent {entries_sent} entries, received {entries_received}"
+                );
+            }
+            if bytes_sent != bytes_received {
+                bail!(
+                    "pull size mismatch: daemon sent {bytes_sent} bytes, received {bytes_received}"
+                );
+            }
+            println!(
+                "pulled {}\t{}\t{} entries\t{} / {} bytes",
+                describe_sources(remote_sources),
+                local_path.display(),
+                entries_received,
+                bytes_received,
+                total_bytes
+            );
+            Ok(())
+        }
+        ControlResponse::Error { code, message } => {
+            bail!("remote error {code:?}: {message}");
+        }
+        other => bail!("unexpected response from daemon: {other:?}"),
+    }
+}
+
+fn split_sources_and_destination(paths: &[String], command: &str) -> Result<(Vec<String>, String)> {
+    let (destination, sources) = paths.split_last().ok_or_else(|| {
+        anyhow!("`rsdb {command}` requires at least one source and one destination")
+    })?;
+    if sources.is_empty() {
+        bail!("`rsdb {command}` requires at least one source and one destination");
+    }
+    Ok((sources.to_vec(), destination.clone()))
+}
+
+fn describe_sources(sources: &[String]) -> String {
+    match sources {
+        [source] => source.clone(),
+        _ => format!("{} sources", sources.len()),
+    }
+}
+
+fn build_local_batch_manifest(source_specs: &[String]) -> Result<LocalBatchManifest> {
+    let sources = expand_local_sources(source_specs)?;
+    let mut roots = Vec::with_capacity(sources.len());
+    let mut entries = Vec::new();
+    let mut files = Vec::new();
+    let mut total_bytes = 0_u64;
+
+    for source in sources {
+        let metadata = fs::symlink_metadata(&source)
+            .with_context(|| format!("failed to stat local path {}", source.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "symbolic links are not supported in batch push: {}",
+                source.display()
+            );
+        }
+
+        let kind = if metadata.is_dir() {
+            TransferEntryKind::Directory
+        } else if metadata.is_file() {
+            TransferEntryKind::File
+        } else {
+            bail!("unsupported local path type: {}", source.display());
+        };
+
+        let root_index = roots.len() as u32;
+        roots.push(TransferRoot {
+            source_name: transfer_source_name(&source)?,
+            kind: kind.clone(),
+            mode: local_file_mode(&metadata),
+        });
+
+        append_local_manifest_entry(
+            root_index,
+            &source,
+            Path::new(""),
+            &metadata,
+            &mut entries,
+            &mut files,
+            &mut total_bytes,
+        )?;
+    }
+
+    ensure_unique_root_names(&roots)?;
+    Ok(LocalBatchManifest {
+        roots,
+        entries,
+        files,
+        total_bytes,
+    })
+}
+
+fn expand_local_sources(source_specs: &[String]) -> Result<Vec<PathBuf>> {
+    let mut sources = Vec::new();
+    for spec in source_specs {
+        let literal_path = PathBuf::from(spec);
+        if has_glob_pattern(spec) && !literal_path.exists() {
+            let mut matches = Vec::new();
+            for entry in glob_with(spec, glob_match_options())
+                .with_context(|| format!("invalid local glob pattern: {spec}"))?
+            {
+                matches.push(
+                    entry.with_context(|| format!("failed to resolve local match for {spec}"))?,
+                );
+            }
+            matches.sort();
+            if matches.is_empty() {
+                bail!("local pattern matched no paths: {spec}");
+            }
+            sources.extend(matches);
+            continue;
+        }
+
+        if !literal_path.exists() {
+            bail!("local path does not exist: {}", literal_path.display());
+        }
+        sources.push(literal_path);
+    }
+    Ok(sources)
+}
+
+fn append_local_manifest_entry(
+    root_index: u32,
+    path: &Path,
+    relative_path: &Path,
+    metadata: &std::fs::Metadata,
+    entries: &mut Vec<TransferEntry>,
+    files: &mut Vec<LocalBatchFile>,
+    total_bytes: &mut u64,
+) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "symbolic links are not supported in batch push: {}",
+            path.display()
+        );
+    }
+
+    if metadata.is_dir() {
+        entries.push(TransferEntry {
+            root_index,
+            relative_path: path_to_transfer_string(relative_path)?,
+            kind: TransferEntryKind::Directory,
+            mode: local_file_mode(metadata),
+            size: 0,
+        });
+
+        let mut children = fs::read_dir(path)
+            .with_context(|| format!("failed to read local directory {}", path.display()))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| format!("failed to read local directory {}", path.display()))?;
+        children.sort();
+
+        for child in children {
+            let child_name = child
+                .file_name()
+                .ok_or_else(|| anyhow!("path has no file name: {}", child.display()))?;
+            let child_relative = if relative_path.as_os_str().is_empty() {
+                PathBuf::from(child_name)
+            } else {
+                relative_path.join(child_name)
+            };
+            let child_metadata = fs::symlink_metadata(&child)
+                .with_context(|| format!("failed to stat local path {}", child.display()))?;
+            append_local_manifest_entry(
+                root_index,
+                &child,
+                &child_relative,
+                &child_metadata,
+                entries,
+                files,
+                total_bytes,
+            )?;
+        }
+        return Ok(());
+    }
+
+    if !metadata.is_file() {
+        bail!("unsupported local path type: {}", path.display());
+    }
+
+    let size = metadata.len();
+    entries.push(TransferEntry {
+        root_index,
+        relative_path: path_to_transfer_string(relative_path)?,
+        kind: TransferEntryKind::File,
+        mode: local_file_mode(metadata),
+        size,
+    });
+    files.push(LocalBatchFile {
+        path: path.to_path_buf(),
+        size,
+    });
+    *total_bytes += size;
+    Ok(())
+}
+
+async fn stream_local_batch_files(stream: &mut TcpStream, files: &[LocalBatchFile]) -> Result<u64> {
+    let mut buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
+    let mut total_bytes = 0_u64;
+
+    for file_entry in files {
+        let mut file = File::open(&file_entry.path)
+            .await
+            .with_context(|| format!("failed to open local file {}", file_entry.path.display()))?;
+        let mut file_bytes = 0_u64;
+        loop {
+            let read = file.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            write_stream_frame(
+                stream,
+                REQUEST_ID,
+                StreamChannel::File,
+                false,
+                &buffer[..read],
+            )
+            .await
+            .context("failed to stream file data")?;
+            total_bytes += read as u64;
+            file_bytes += read as u64;
+        }
+        if file_bytes != file_entry.size {
+            bail!(
+                "local file changed during push: expected {} bytes, read {} from {}",
+                file_entry.size,
+                file_bytes,
+                file_entry.path.display()
+            );
+        }
+    }
+
+    Ok(total_bytes)
+}
+
+async fn receive_local_batch(
+    stream: &mut TcpStream,
+    destination: &Path,
+    destination_arg: &str,
+    roots: &[TransferRoot],
+    entries: &[TransferEntry],
+) -> Result<(u64, u64)> {
+    let root_paths = resolve_local_batch_roots(destination, destination_arg, roots)?;
+    let mut entries_received = 0_u64;
     let mut bytes_received = 0_u64;
 
-    loop {
-        let frame = read_frame(&mut stream)
-            .await
-            .context("failed to read pull frame")?;
-        match frame.header.kind {
-            FrameKind::Stream => {
-                let chunk = decode_stream_frame(&frame).context("invalid stream frame")?;
-                ensure_request_id(chunk.request_id, REQUEST_ID)?;
-                if chunk.channel != StreamChannel::File {
-                    bail!("unexpected stream channel during pull: {:?}", chunk.channel);
-                }
-                if !chunk.payload.is_empty() {
-                    file.write_all(&chunk.payload)
-                        .await
-                        .with_context(|| format!("failed to write {}", local_path.display()))?;
-                    bytes_received += chunk.payload.len() as u64;
+    for entry in entries {
+        let output_path = resolve_transfer_entry_path(&root_paths, entry)?;
+        match entry.kind {
+            TransferEntryKind::Directory => {
+                tokio::fs::create_dir_all(&output_path)
+                    .await
+                    .with_context(|| {
+                        format!("failed to create local directory {}", output_path.display())
+                    })?;
+                #[cfg(unix)]
+                if entry.mode != 0 {
+                    tokio::fs::set_permissions(
+                        &output_path,
+                        std::fs::Permissions::from_mode(entry.mode & 0o7777),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("failed to set permissions on {}", output_path.display())
+                    })?;
                 }
             }
-            FrameKind::Response => {
-                let response: ControlResponse =
-                    decode_json(&frame, FrameKind::Response).context("invalid response frame")?;
-                match response {
-                    ControlResponse::PullComplete { bytes_sent } => {
-                        file.flush().await?;
-                        #[cfg(unix)]
-                        if mode != 0 {
-                            tokio::fs::set_permissions(
-                                local_path,
-                                std::fs::Permissions::from_mode(mode & 0o7777),
-                            )
-                            .await
-                            .with_context(|| {
-                                format!("failed to set permissions on {}", local_path.display())
-                            })?;
-                        }
-                        if bytes_sent != bytes_received {
-                            bail!(
-                                "pull size mismatch: daemon sent {bytes_sent} bytes, received {bytes_received}"
-                            );
-                        }
-                        println!(
-                            "pulled {}\t{}\t{} / {} bytes",
-                            remote_path,
-                            local_path.display(),
-                            bytes_received,
-                            size
+            TransferEntryKind::File => {
+                let mut file = create_local_output_file(&output_path, entry.mode).await?;
+                let mut remaining = entry.size;
+                while remaining > 0 {
+                    let chunk = read_file_stream_chunk(stream, "pull").await?;
+                    if chunk.eof {
+                        bail!(
+                            "unexpected end of pull stream while writing {}",
+                            output_path.display()
                         );
-                        return Ok(());
                     }
-                    ControlResponse::Error { code, message } => {
-                        bail!("remote error {code:?}: {message}");
+                    if chunk.payload.len() as u64 > remaining {
+                        bail!(
+                            "pull stream overflow while writing {}",
+                            output_path.display()
+                        );
                     }
-                    other => bail!("unexpected response from daemon: {other:?}"),
+                    if !chunk.payload.is_empty() {
+                        file.write_all(&chunk.payload).await.with_context(|| {
+                            format!("failed to write {}", output_path.display())
+                        })?;
+                        remaining -= chunk.payload.len() as u64;
+                        bytes_received += chunk.payload.len() as u64;
+                    }
+                }
+                file.flush().await?;
+                #[cfg(unix)]
+                if entry.mode != 0 {
+                    tokio::fs::set_permissions(
+                        &output_path,
+                        std::fs::Permissions::from_mode(entry.mode & 0o7777),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("failed to set permissions on {}", output_path.display())
+                    })?;
                 }
             }
-            other => bail!("unexpected frame kind during pull: {other:?}"),
         }
+        entries_received += 1;
+    }
+
+    expect_file_stream_eof(stream, "pull").await?;
+    Ok((entries_received, bytes_received))
+}
+
+async fn read_file_stream_chunk(
+    stream: &mut TcpStream,
+    context_name: &str,
+) -> Result<rsdb_proto::StreamFrame> {
+    let frame = read_frame(stream)
+        .await
+        .with_context(|| format!("failed to read {context_name} frame"))?;
+    if frame.header.kind != FrameKind::Stream {
+        bail!(
+            "unexpected frame kind during {context_name}: {:?}",
+            frame.header.kind
+        );
+    }
+    let chunk = decode_stream_frame(&frame).context("invalid stream frame")?;
+    ensure_request_id(chunk.request_id, REQUEST_ID)?;
+    if chunk.channel != StreamChannel::File {
+        bail!(
+            "unexpected stream channel during {context_name}: {:?}",
+            chunk.channel
+        );
+    }
+    Ok(chunk)
+}
+
+async fn expect_file_stream_eof(stream: &mut TcpStream, context_name: &str) -> Result<()> {
+    let chunk = read_file_stream_chunk(stream, context_name).await?;
+    if !chunk.eof || !chunk.payload.is_empty() {
+        bail!("expected end of {context_name} file stream");
+    }
+    Ok(())
+}
+
+fn resolve_local_batch_roots(
+    destination: &Path,
+    destination_arg: &str,
+    roots: &[TransferRoot],
+) -> Result<Vec<PathBuf>> {
+    if roots.is_empty() {
+        bail!("transfer manifest did not include any roots");
+    }
+    ensure_unique_root_names(roots)?;
+
+    let destination_metadata = match fs::metadata(destination) {
+        Ok(metadata) => Some(metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to stat local destination {}", destination.display())
+            });
+        }
+    };
+
+    if roots.len() == 1 {
+        let treat_as_directory = destination_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.is_dir())
+            || destination_arg.ends_with('/')
+            || destination_arg.ends_with(std::path::MAIN_SEPARATOR);
+        let root = &roots[0];
+        let base = if treat_as_directory {
+            destination.join(&root.source_name)
+        } else {
+            destination.to_path_buf()
+        };
+        return Ok(vec![base]);
+    }
+
+    if destination_metadata
+        .as_ref()
+        .is_some_and(|metadata| !metadata.is_dir())
+    {
+        bail!(
+            "local destination is not a directory: {}",
+            destination.display()
+        );
+    }
+
+    Ok(roots
+        .iter()
+        .map(|root| destination.join(&root.source_name))
+        .collect())
+}
+
+fn resolve_transfer_entry_path(root_paths: &[PathBuf], entry: &TransferEntry) -> Result<PathBuf> {
+    let root_path = root_paths
+        .get(entry.root_index as usize)
+        .ok_or_else(|| anyhow!("invalid transfer root index {}", entry.root_index))?;
+    join_transfer_relative_path(root_path, &entry.relative_path)
+}
+
+fn join_transfer_relative_path(base: &Path, relative_path: &str) -> Result<PathBuf> {
+    if relative_path.is_empty() {
+        return Ok(base.to_path_buf());
+    }
+
+    let mut resolved = base.to_path_buf();
+    for component in Path::new(relative_path).components() {
+        match component {
+            Component::Normal(part) => resolved.push(part),
+            _ => bail!("invalid transfer path: {relative_path}"),
+        }
+    }
+    Ok(resolved)
+}
+
+fn ensure_unique_root_names(roots: &[TransferRoot]) -> Result<()> {
+    let mut seen = BTreeMap::new();
+    for root in roots {
+        if let Some(previous) = seen.insert(root.source_name.clone(), root.kind.clone()) {
+            bail!(
+                "duplicate transfer root name `{}` is not supported ({previous:?} and {:?})",
+                root.source_name,
+                root.kind
+            );
+        }
+    }
+    Ok(())
+}
+
+fn transfer_source_name(path: &Path) -> Result<String> {
+    if let Some(name) = path.file_name().filter(|name| !name.is_empty()) {
+        return Ok(name.to_string_lossy().into_owned());
+    }
+
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+    canonical
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow!("path has no usable file name: {}", path.display()))
+}
+
+fn path_to_transfer_string(path: &Path) -> Result<String> {
+    if path.as_os_str().is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            _ => bail!("invalid transfer path: {}", path.display()),
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+fn has_glob_pattern(value: &str) -> bool {
+    value.bytes().any(|byte| matches!(byte, b'*' | b'?' | b'['))
+}
+
+fn glob_match_options() -> MatchOptions {
+    MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
     }
 }
 
