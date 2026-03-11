@@ -923,6 +923,7 @@ fn append_local_manifest_entry(
 }
 
 async fn stream_local_batch_files(stream: &mut TcpStream, files: &[LocalBatchFile]) -> Result<u64> {
+    let mut writer = tokio::io::BufWriter::new(&mut *stream);
     let mut buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
     let mut total_bytes = 0_u64;
 
@@ -937,7 +938,7 @@ async fn stream_local_batch_files(stream: &mut TcpStream, files: &[LocalBatchFil
                 break;
             }
             write_stream_frame(
-                stream,
+                &mut writer,
                 REQUEST_ID,
                 StreamChannel::File,
                 false,
