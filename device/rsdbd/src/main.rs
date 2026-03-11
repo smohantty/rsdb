@@ -571,6 +571,7 @@ async fn handle_pipe_shell(
     let mut stdout_open = true;
     let mut stderr_open = true;
     let mut exit_status = None;
+    let mut wait = Box::pin(child.wait());
     let mut stdout_buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
     let mut stderr_buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
 
@@ -634,12 +635,8 @@ async fn handle_pipe_shell(
                     ).await?;
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)), if exit_status.is_none() => {
-                if let Some(status) = child.try_wait().context("failed to poll shell process")? {
-                    exit_status = Some(status);
-                    stdout_open = false;
-                    stderr_open = false;
-                }
+            status = &mut wait, if exit_status.is_none() => {
+                exit_status = Some(status.context("failed to wait for shell process")?);
             }
         }
     }
@@ -650,10 +647,7 @@ async fn handle_pipe_shell(
 
     let status = match exit_status {
         Some(status) => status,
-        None => child
-            .wait()
-            .await
-            .context("failed to wait for shell process")?,
+        None => wait.await.context("failed to wait for shell process")?,
     };
     write_json_frame(
         &mut writer,
