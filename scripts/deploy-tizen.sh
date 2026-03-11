@@ -64,6 +64,11 @@ else
     echo "Keeping existing environment file at $ENV_FILE"
 fi
 
+if grep -q '^RSDB_DEVICE_NAME=' "$ENV_FILE"; then
+    echo "Removing stale RSDB_DEVICE_NAME override from $ENV_FILE"
+    sed -i '/^RSDB_DEVICE_NAME=/d' "$ENV_FILE"
+fi
+
 echo "Reloading systemd"
 systemctl daemon-reload
 echo "Enabling service $SERVICE_NAME"
@@ -86,3 +91,4 @@ echo "Installed rsdbd to $INSTALL_BIN"
 echo "Installed service to $INSTALL_SERVICE"
 echo "Runtime env file: $ENV_FILE"
 echo "Log file: $LOG_FILE"
+echo "Device name: auto-detected by rsdbd"

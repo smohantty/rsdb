@@ -61,6 +61,7 @@ Copy these files to the target device into the same directory:
 - `deploy-tizen.sh`
 
 Use `scripts/deploy-tizen.sh` and the default service file from `packaging/systemd/rsdbd.service`. The service starts `rsdbd` on `0.0.0.0:27101`.
+The daemon auto-detects its discovery name and platform on the target device.
 
 You can use any transport you want for that copy step: `scp`, `sdb`, removable media, or your own tooling.
 
