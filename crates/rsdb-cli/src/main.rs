@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
 use glob::{MatchOptions, glob_with};
 use rsdb_proto::{
-    CapabilitySet, ControlRequest, ControlResponse, DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest,
+    CapabilitySet, ControlRequest, ControlResponse, DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest, HEADER_LEN,
     DiscoveryResponse, FrameKind, MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION, StreamChannel,
     TransferEntry, TransferEntryKind, TransferRoot, decode_discovery_message, decode_json,
     decode_stream_frame, encode_discovery_message, read_frame, write_json_frame,
@@ -923,7 +923,7 @@ fn append_local_manifest_entry(
 }
 
 async fn stream_local_batch_files(stream: &mut TcpStream, files: &[LocalBatchFile]) -> Result<u64> {
-    let mut writer = tokio::io::BufWriter::new(&mut *stream);
+    let mut writer = tokio::io::BufWriter::with_capacity(HEADER_LEN + DEFAULT_STREAM_CHUNK_SIZE, &mut *stream);
     let mut buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
     let mut total_bytes = 0_u64;
 
