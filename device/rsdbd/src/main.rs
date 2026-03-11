@@ -1,5 +1,5 @@
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{fs::File as StdFile, fs::OpenOptions as StdOpenOptions, io};
 
@@ -26,7 +26,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::process::Command;
 use tokio::time::timeout;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
+
+const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Parser)]
 #[command(name = "rsdbd")]
@@ -45,6 +47,7 @@ struct ServerState {
     server_id: Arc<str>,
     device_name: Arc<str>,
     platform: Arc<str>,
+    shell_path: Arc<str>,
     exec_timeout: Duration,
     tcp_port: u16,
 }
@@ -60,6 +63,29 @@ enum PtyOutput {
     Error(String),
 }
 
+#[derive(Clone)]
+struct SharedLogWriter {
+    file: Arc<Mutex<StdFile>>,
+}
+
+impl io::Write for SharedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut file = match self.file.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        file.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut file = match self.file.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        file.flush()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing()?;
@@ -73,10 +99,12 @@ async fn main() -> Result<()> {
     let server_id = args.server_id.unwrap_or_else(default_server_id);
     let device_name = detect_device_name();
     let platform = detect_platform();
+    let shell_path = detect_default_shell();
     let state = ServerState {
         server_id: Arc::from(server_id),
         device_name: Arc::from(device_name),
         platform: Arc::from(platform),
+        shell_path: Arc::from(shell_path),
         exec_timeout: Duration::from_secs(args.exec_timeout_secs),
         tcp_port: listen_addr.port(),
     };
@@ -92,7 +120,7 @@ async fn main() -> Result<()> {
     let discovery_state = state.clone();
     tokio::spawn(async move {
         if let Err(err) = handle_discovery(discovery_socket, discovery_state).await {
-            debug!(error = %err, "discovery socket stopped");
+            warn!(error = %err, "discovery socket stopped");
         }
     });
 
@@ -101,7 +129,7 @@ async fn main() -> Result<()> {
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_connection(stream, state).await {
-                debug!(peer = %peer, error = %err, "connection closed with error");
+                warn!(peer = %peer, error = %err, "connection closed with error");
             }
         });
     }
@@ -123,12 +151,10 @@ fn init_tracing() -> Result<()> {
             .append(true)
             .open(&log_file)
             .with_context(|| format!("failed to open log file: {log_file}"))?;
-        builder
-            .with_writer(move || {
-                file.try_clone()
-                    .unwrap_or_else(|err| panic!("failed to clone log file handle: {err}"))
-            })
-            .init();
+        let writer = SharedLogWriter {
+            file: Arc::new(Mutex::new(file)),
+        };
+        builder.with_writer(move || writer.clone()).init();
     } else {
         builder.with_writer(io::stderr).init();
     }
@@ -230,12 +256,16 @@ async fn handle_discovery(socket: UdpSocket, state: ServerState) -> Result<()> {
 }
 
 async fn handle_connection(mut stream: TcpStream, state: ServerState) -> Result<()> {
-    let frame = match read_frame(&mut stream).await {
-        Ok(frame) => frame,
-        Err(ProtocolError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+    let frame = match timeout(INITIAL_REQUEST_TIMEOUT, read_frame(&mut stream)).await {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(ProtocolError::Io(err))) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
             return Ok(());
         }
-        Err(err) => return Err(err.into()),
+        Ok(Err(err)) => return Err(err.into()),
+        Err(_) => bail!(
+            "timed out waiting for initial request after {} seconds",
+            INITIAL_REQUEST_TIMEOUT.as_secs()
+        ),
     };
 
     let request_id = frame.header.request_id;
@@ -284,13 +314,8 @@ async fn handle_request(
             }
         }
         ControlRequest::Pull { path } => {
-            let code = if matches!(metadata(&path).await, Err(err) if err.kind() == std::io::ErrorKind::NotFound)
-            {
-                ErrorCode::NotFound
-            } else {
-                ErrorCode::FileTransferFailed
-            };
             if let Err(err) = handle_pull(&mut stream, request_id, &path).await {
+                let code = classify_pull_error(&err);
                 send_error(&mut stream, request_id, code, err).await?;
             }
         }
@@ -302,8 +327,10 @@ async fn handle_request(
             rows,
             cols,
         } => {
-            if let Err(err) =
-                handle_shell(stream, request_id, command, args, pty, term, rows, cols).await
+            if let Err(err) = handle_shell(
+                stream, request_id, command, args, pty, term, rows, cols, state,
+            )
+            .await
             {
                 return Err(err);
             }
@@ -515,12 +542,13 @@ async fn handle_shell(
     term: Option<String>,
     rows: Option<u16>,
     cols: Option<u16>,
+    state: &ServerState,
 ) -> Result<()> {
     if pty {
-        return handle_pty_shell(stream, request_id, command, args, term, rows, cols).await;
+        return handle_pty_shell(stream, request_id, command, args, term, rows, cols, state).await;
     }
 
-    handle_pipe_shell(stream, request_id, command, args).await
+    handle_pipe_shell(stream, request_id, command, args, state).await
 }
 
 async fn handle_pipe_shell(
@@ -528,8 +556,9 @@ async fn handle_pipe_shell(
     request_id: u32,
     command: Option<String>,
     args: Vec<String>,
+    state: &ServerState,
 ) -> Result<()> {
-    let (display_command, mut child) = spawn_pipe_shell(command, args)?;
+    let (display_command, mut child) = spawn_pipe_shell(command, args, &state.shell_path)?;
     let (mut reader, mut writer) = stream.into_split();
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(32);
     tokio::spawn(async move {
@@ -669,9 +698,10 @@ async fn handle_pty_shell(
     term: Option<String>,
     rows: Option<u16>,
     cols: Option<u16>,
+    state: &ServerState,
 ) -> Result<()> {
     let (display_command, mut child, controller) =
-        spawn_pty_shell(command, args, term, rows, cols)?;
+        spawn_pty_shell(command, args, term, rows, cols, &state.shell_path)?;
     let (mut reader, mut writer) = stream.into_split();
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(32);
     tokio::spawn(async move {
@@ -788,19 +818,23 @@ async fn handle_pty_shell(
 fn spawn_pipe_shell(
     command: Option<String>,
     args: Vec<String>,
+    shell: &str,
 ) -> Result<(String, tokio::process::Child)> {
-    let shell = default_shell();
     let (display_command, program, argv) = match command {
         Some(command) if !command.trim().is_empty() => {
             let command_line = join_shell_command(&command, &args);
             (
                 format!("{shell} -c {command_line}"),
-                shell.clone(),
+                shell.to_string(),
                 vec!["-c".to_string(), command_line],
             )
         }
         Some(_) => bail!("shell command must not be empty"),
-        None => (format!("{shell} -i"), shell.clone(), vec!["-i".to_string()]),
+        None => (
+            format!("{shell} -i"),
+            shell.to_string(),
+            vec!["-i".to_string()],
+        ),
     };
 
     let mut child = Command::new(&program);
@@ -821,19 +855,23 @@ fn spawn_pty_shell(
     term: Option<String>,
     rows: Option<u16>,
     cols: Option<u16>,
+    shell: &str,
 ) -> Result<(String, tokio::process::Child, StdFile)> {
-    let shell = default_shell();
     let (display_command, program, argv) = match command {
         Some(command) if !command.trim().is_empty() => {
             let command_line = join_shell_command(&command, &args);
             (
                 format!("{shell} -c {command_line}"),
-                shell.clone(),
+                shell.to_string(),
                 vec!["-c".to_string(), command_line],
             )
         }
         Some(_) => bail!("shell command must not be empty"),
-        None => (format!("{shell} -i"), shell.clone(), vec!["-i".to_string()]),
+        None => (
+            format!("{shell} -i"),
+            shell.to_string(),
+            vec!["-i".to_string()],
+        ),
     };
 
     let winsize = shell_winsize(rows, cols);
@@ -936,14 +974,14 @@ fn is_pty_closed_error(err: &std::io::Error) -> bool {
         std::io::ErrorKind::BrokenPipe
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::UnexpectedEof
-    ) || err.raw_os_error() == Some(5)
+    ) || err.raw_os_error() == Some(rustix_openpty::rustix::io::Errno::IO.raw_os_error())
 }
 
 fn rustix_errno_to_io_error(err: rustix_openpty::rustix::io::Errno) -> std::io::Error {
     std::io::Error::from_raw_os_error(err.raw_os_error())
 }
 
-fn default_shell() -> String {
+fn detect_default_shell() -> String {
     if let Some(shell) = std::env::var("RSDB_DEFAULT_SHELL")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -958,6 +996,22 @@ fn default_shell() -> String {
     }
 
     "/bin/sh".to_string()
+}
+
+fn classify_pull_error(err: &anyhow::Error) -> ErrorCode {
+    if has_io_error_kind(err, std::io::ErrorKind::NotFound) {
+        ErrorCode::NotFound
+    } else {
+        ErrorCode::FileTransferFailed
+    }
+}
+
+fn has_io_error_kind(err: &anyhow::Error, expected: std::io::ErrorKind) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| io_err.kind() == expected)
+    })
 }
 
 fn join_shell_command(command: &str, args: &[String]) -> String {

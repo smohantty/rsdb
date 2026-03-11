@@ -53,7 +53,9 @@ install -Dm755 "$BINARY_PATH" "$INSTALL_BIN"
 echo "Installing service file to $INSTALL_SERVICE"
 install -Dm644 "$SERVICE_FILE" "$INSTALL_SERVICE"
 echo "Ensuring log file exists at $LOG_FILE"
-install -Dm644 /dev/null "$LOG_FILE"
+install -d -m755 "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
+chmod 644 "$LOG_FILE"
 if [[ ! -f "$ENV_FILE" ]]; then
     echo "Creating default environment file at $ENV_FILE"
     cat >"$ENV_FILE" <<'EOF'

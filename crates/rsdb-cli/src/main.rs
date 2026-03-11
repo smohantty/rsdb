@@ -28,6 +28,7 @@ use tokio::time::timeout;
 use tracing::{debug, trace};
 
 const REQUEST_ID: u32 = 1;
+const DEFAULT_RSDB_PORT: u16 = 27101;
 
 struct RawModeGuard(bool);
 
@@ -67,7 +68,7 @@ enum Commands {
     Discover {
         #[arg(long, default_value = "255.255.255.255")]
         probe_addr: String,
-        #[arg(long, default_value_t = 27101)]
+        #[arg(long, default_value_t = DEFAULT_RSDB_PORT)]
         port: u16,
         #[arg(long, default_value_t = 1000)]
         timeout_ms: u64,
@@ -161,7 +162,8 @@ fn init_tracing() {
 }
 
 async fn connect_command(addr: &str, requested_name: Option<&str>) -> Result<()> {
-    let response = request(addr, ControlRequest::Ping).await?;
+    let addr = normalize_connect_addr(addr);
+    let response = request(&addr, ControlRequest::Ping).await?;
     let (server_id, protocol_version) = match response {
         ControlResponse::Pong {
             server_id,
@@ -179,11 +181,11 @@ async fn connect_command(addr: &str, requested_name: Option<&str>) -> Result<()>
 
     let name = requested_name
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| default_name(addr));
+        .unwrap_or_else(|| default_name(&addr));
     let registry = Registry {
         targets: vec![StoredTarget {
             name: name.clone(),
-            addr: addr.to_string(),
+            addr: addr.clone(),
         }],
         current_target: Some(name.clone()),
     };
@@ -394,7 +396,11 @@ async fn shell_command(target: Option<&str>, command: &[String]) -> Result<()> {
         Some((program, args)) => (Some(program.clone()), args.to_vec(), false),
         None => (None, Vec::new(), true),
     };
-    run_shell_session(&addr, program, args, interactive).await
+    let status = run_shell_session(&addr, program, args, interactive).await?;
+    if status != 0 {
+        std::process::exit(normalize_exit_status(status));
+    }
+    Ok(())
 }
 
 async fn push_command(target: Option<&str>, local_path: &Path, remote_path: &str) -> Result<()> {
@@ -565,7 +571,7 @@ async fn run_shell_session(
     command: Option<String>,
     args: Vec<String>,
     interactive: bool,
-) -> Result<()> {
+) -> Result<i32> {
     let mut stream = open_connection(addr).await?;
     let term = interactive.then(remote_term);
     let (rows, cols) = interactive
@@ -686,9 +692,9 @@ async fn run_shell_session(
                                 stdout.flush().await?;
                                 stderr.flush().await?;
                                 if !interactive && status != 0 {
-                                    bail!("remote shell exited with status {status}");
+                                    return Ok(status);
                                 }
-                                return Ok(());
+                                return Ok(status);
                             }
                             ControlResponse::Error { code, message } => {
                                 bail!("remote error {code:?}: {message}");
@@ -700,6 +706,14 @@ async fn run_shell_session(
                 }
             }
         }
+    }
+}
+
+fn normalize_exit_status(status: i32) -> i32 {
+    if (0..=255).contains(&status) {
+        status
+    } else {
+        1
     }
 }
 
@@ -833,16 +847,14 @@ fn ensure_request_id(actual: u32, expected: u32) -> Result<()> {
 
 fn resolve_target(input: Option<&str>) -> Result<String> {
     if let Some(value) = input {
-        if value.contains(':') {
-            return Ok(value.to_string());
+        let registry = load_registry()?;
+        if let Some(target) = primary_target(&registry)
+            && target.name == value
+        {
+            return Ok(target.addr.clone());
         }
 
-        let registry = load_registry()?;
-        let target = primary_target(&registry).ok_or_else(|| anyhow!("no saved targets"))?;
-        if target.name != value {
-            bail!("no saved target named {value}");
-        }
-        return Ok(target.addr.clone());
+        return Ok(normalize_connect_addr(value));
     }
 
     let registry = load_registry()?;
@@ -926,6 +938,28 @@ fn default_name(addr: &str) -> String {
             _ => '-',
         })
         .collect()
+}
+
+fn normalize_connect_addr(value: &str) -> String {
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return addr.to_string();
+    }
+
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return SocketAddr::new(ip, DEFAULT_RSDB_PORT).to_string();
+    }
+
+    if has_port_suffix(value) {
+        return value.to_string();
+    }
+
+    format!("{value}:{DEFAULT_RSDB_PORT}")
+}
+
+fn has_port_suffix(value: &str) -> bool {
+    value
+        .rsplit_once(':')
+        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
 }
 
 #[cfg(unix)]
