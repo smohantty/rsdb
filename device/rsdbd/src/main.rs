@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
         .local_addr()
         .context("failed to read bound tcp listener address")?;
     let server_id = args.server_id.unwrap_or_else(default_server_id);
-    let device_name = detect_device_name(&server_id);
+    let device_name = detect_device_name();
     let platform = detect_platform();
     let state = ServerState {
         server_id: Arc::from(server_id),
@@ -142,37 +142,11 @@ fn default_server_id() -> String {
         .unwrap_or_else(|| "rsdbd".to_string())
 }
 
-fn detect_device_name(server_id: &str) -> String {
-    detect_hostname().unwrap_or_else(|| server_id.to_string())
-}
-
-fn detect_hostname() -> Option<String> {
-    // /etc/hostname — standard on Tizen/Linux
-    if let Some(name) = std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|s| clean_hostname(s.trim()))
-        .filter(|s| is_useful_hostname(s))
-    {
-        return Some(name);
-    }
-
-    // `uname -n` — part of coreutils, always present on Linux/macOS/Tizen
-    if let Some(name) = run_command("uname -n")
-        .map(|s| clean_hostname(&s))
-        .filter(|s| is_useful_hostname(s))
-    {
-        return Some(name);
-    }
-
-    None
-}
-
-fn clean_hostname(name: &str) -> String {
-    name.strip_suffix(".local").unwrap_or(name).to_string()
-}
-
-fn is_useful_hostname(name: &str) -> bool {
-    !name.is_empty() && name != "localhost" && name != "(none)"
+fn detect_device_name() -> String {
+    detect_os_release_value("NAME")
+        .or_else(|| detect_os_release_value("PRETTY_NAME"))
+        .or_else(|| run_command("uname -s"))
+        .unwrap_or_else(|| std::env::consts::OS.to_string())
 }
 
 fn detect_platform() -> String {
@@ -183,21 +157,24 @@ fn detect_platform() -> String {
 
 fn detect_os_name() -> String {
     // /etc/os-release PRETTY_NAME — standard on Tizen/Linux
-    if let Some(name) = std::fs::read_to_string("/etc/os-release")
-        .ok()
-        .and_then(|content| {
-            content.lines().find_map(|line| {
-                let value = line.strip_prefix("PRETTY_NAME=")?;
-                let value = value.trim().trim_matches('"');
-                (!value.is_empty()).then(|| value.to_string())
-            })
-        })
-    {
+    if let Some(name) = detect_os_release_value("PRETTY_NAME") {
         return name;
     }
 
     // `uname -sr` — works everywhere, gives OS name + version (e.g. "Linux 5.10.0")
     run_command("uname -sr").unwrap_or_else(|| std::env::consts::OS.to_string())
+}
+
+fn detect_os_release_value(key: &str) -> Option<String> {
+    std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|content| {
+            content.lines().find_map(|line| {
+                let value = line.strip_prefix(&format!("{key}="))?;
+                let value = value.trim().trim_matches('"');
+                (!value.is_empty()).then(|| value.to_string())
+            })
+        })
 }
 
 fn run_command(cmd: &str) -> Option<String> {

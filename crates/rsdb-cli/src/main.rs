@@ -255,9 +255,7 @@ async fn discover_command(probe_addr: &str, port: u16, timeout_ms: u64) -> Resul
     for target in &targets {
         println!(
             "{:<name_width$}   {:<addr_width$}   {}",
-            target.device_name,
-            target.addr,
-            target.platform,
+            target.device_name, target.addr, target.platform,
         );
     }
     Ok(())

@@ -484,5 +484,4 @@ mod tests {
             decode_discovery_message(&encoded).expect("discovery should decode");
         assert_eq!(decoded, expected);
     }
-
 }
