@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use glob::{MatchOptions, glob_with};
 use rsdb_proto::{
-    CapabilitySet, ControlRequest, ControlResponse, DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest,
+    CapabilitySet, ControlRequest, ControlResponse, DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest, HEADER_LEN,
     DiscoveryResponse, ErrorCode, FrameKind, MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION,
     ProtocolError, StreamChannel, TransferEntry, TransferEntryKind, TransferRoot,
     decode_discovery_message, decode_json, decode_stream_frame, encode_discovery_message,
@@ -530,7 +530,7 @@ async fn handle_pull(stream: &mut TcpStream, request_id: u32, path: &str) -> Res
         .with_context(|| format!("failed to open remote path for read: {path}"))?;
     let mode = file_mode(&file_meta);
 
-    let mut writer = tokio::io::BufWriter::new(&mut *stream);
+    let mut writer = tokio::io::BufWriter::with_capacity(HEADER_LEN + DEFAULT_STREAM_CHUNK_SIZE, &mut *stream);
     write_json_frame(
         &mut writer,
         FrameKind::Response,
@@ -891,7 +891,7 @@ async fn stream_batch_files(
     request_id: u32,
     files: &[BatchFileSource],
 ) -> Result<u64> {
-    let mut writer = tokio::io::BufWriter::new(&mut *stream);
+    let mut writer = tokio::io::BufWriter::with_capacity(HEADER_LEN + DEFAULT_STREAM_CHUNK_SIZE, &mut *stream);
     let mut buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
     let mut total_bytes = 0_u64;
 
