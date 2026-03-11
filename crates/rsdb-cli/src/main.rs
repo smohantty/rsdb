@@ -1235,7 +1235,8 @@ async fn run_shell_session(
         }
         other => bail!("unexpected response from daemon: {other:?}"),
     }
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, writer) = stream.into_split();
+    let mut writer = tokio::io::BufWriter::new(writer);
     let (frame_tx, mut frame_rx) = mpsc::channel(32);
     tokio::spawn(async move {
         loop {
@@ -1437,10 +1438,14 @@ async fn request(addr: &str, request: ControlRequest) -> Result<ControlResponse>
 
 async fn open_connection(addr: &str) -> Result<TcpStream> {
     debug!(target_addr = %addr, "opening tcp connection");
-    timeout(Duration::from_secs(5), TcpStream::connect(addr))
+    let stream = timeout(Duration::from_secs(5), TcpStream::connect(addr))
         .await
         .context("connection timed out")?
-        .with_context(|| format!("failed to connect to {addr}"))
+        .with_context(|| format!("failed to connect to {addr}"))?;
+    stream
+        .set_nodelay(true)
+        .context("failed to set TCP_NODELAY")?;
+    Ok(stream)
 }
 
 async fn read_response(stream: &mut TcpStream) -> Result<ControlResponse> {
