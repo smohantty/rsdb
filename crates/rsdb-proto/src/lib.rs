@@ -431,7 +431,7 @@ where
     Ok(serde_json::from_slice(&frame.payload)?)
 }
 
-pub fn decode_stream_frame(frame: &Frame) -> Result<StreamFrame, ProtocolError> {
+pub fn decode_stream_frame(frame: Frame) -> Result<StreamFrame, ProtocolError> {
     if frame.header.kind != FrameKind::Stream {
         return Err(ProtocolError::UnexpectedFrameKind {
             expected: FrameKind::Stream,
@@ -445,7 +445,7 @@ pub fn decode_stream_frame(frame: &Frame) -> Result<StreamFrame, ProtocolError> 
         request_id: frame.header.request_id,
         channel,
         eof,
-        payload: frame.payload.clone(),
+        payload: frame.payload,
     })
 }
 
@@ -505,7 +505,7 @@ mod tests {
 
         let frame = read_frame(&mut server).await.expect("frame should read");
         send.await.expect("writer task should finish");
-        let decoded = decode_stream_frame(&frame).expect("stream frame should decode");
+        let decoded = decode_stream_frame(frame).expect("stream frame should decode");
         assert_eq!(decoded.request_id, 5);
         assert_eq!(decoded.channel, StreamChannel::File);
         assert!(decoded.eof);

@@ -1052,7 +1052,7 @@ async fn read_file_stream_chunk(
             frame.header.kind
         );
     }
-    let chunk = decode_stream_frame(&frame).context("invalid stream frame")?;
+    let chunk = decode_stream_frame(frame).context("invalid stream frame")?;
     ensure_request_id(chunk.request_id, REQUEST_ID)?;
     if chunk.channel != StreamChannel::File {
         bail!(
@@ -1300,7 +1300,7 @@ async fn run_shell_session(
                 trace!(kind = ?frame.header.kind, payload = frame.payload.len(), "received shell frame");
                 match frame.header.kind {
                     FrameKind::Stream => {
-                        let chunk = decode_stream_frame(&frame).context("invalid stream frame")?;
+                        let chunk = decode_stream_frame(frame).context("invalid stream frame")?;
                         ensure_request_id(chunk.request_id, REQUEST_ID)?;
                         match chunk.channel {
                             StreamChannel::Stdout => {
