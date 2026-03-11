@@ -452,7 +452,7 @@ async fn handle_push(
     let mut bytes_written = 0_u64;
     loop {
         let frame = read_frame(stream).await?;
-        let chunk = decode_stream_frame(&frame)?;
+        let chunk = decode_stream_frame(frame)?;
         expect_stream_chunk(&chunk, request_id, StreamChannel::File)?;
 
         if !chunk.payload.is_empty() {
@@ -943,7 +943,7 @@ async fn read_file_stream_chunk(
             frame.header.kind
         );
     }
-    let chunk = decode_stream_frame(&frame)?;
+    let chunk = decode_stream_frame(frame)?;
     expect_stream_chunk(&chunk, request_id, StreamChannel::File)?;
     Ok(chunk)
 }
@@ -1167,7 +1167,7 @@ async fn handle_pipe_shell(
             frame = frame_rx.recv(), if stdin_open => {
                 match frame {
                     Some(Ok(frame)) => {
-                        let chunk = decode_stream_frame(&frame)?;
+                        let chunk = decode_stream_frame(frame)?;
                         expect_stream_chunk(&chunk, request_id, StreamChannel::Stdin)?;
                         if !chunk.payload.is_empty() {
                             child_stdin.write_all(&chunk.payload).await?;
@@ -1303,7 +1303,7 @@ async fn handle_pty_shell(
             frame = frame_rx.recv(), if stdin_open => {
                 match frame {
                     Some(Ok(frame)) => {
-                        let chunk = decode_stream_frame(&frame)?;
+                        let chunk = decode_stream_frame(frame)?;
                         expect_stream_chunk(&chunk, request_id, StreamChannel::Stdin)?;
                         if !chunk.payload.is_empty() {
                             if let Some(tx) = &pty_input_tx {
