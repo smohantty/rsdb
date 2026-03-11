@@ -27,10 +27,14 @@ Default port:
 
 - root-capable environment
 - `systemd`
-- writable `/usr/bin` and `/etc/systemd/system`
-- `install` and `systemctl`
-- an `rsdbd` binary built for the target architecture
-- a way to copy files onto the target device before running the deploy script
+- `rpm`
+- writable `/usr/bin` and `/usr/lib/systemd/system`
+- `systemctl`
+
+### Host packaging tools for `rsdbd`
+
+- `cargo-tizen`
+- `rpmbuild`
 
 ## Host Installation
 
@@ -48,47 +52,59 @@ cargo install --path crates/rsdb-cli --root /usr/local --force
 
 ## Target Deployment
 
-Build `rsdbd` for the Tizen target architecture on the host first:
+Build a Tizen RPM for `rsdbd` on the host:
 
 ```bash
-cargo tizen build --release -- -p rsdbd
+./scripts/build-rsdbd-rpm.sh aarch64
 ```
 
-Copy these files to the target device into the same directory:
-
-- `rsdbd`
-- `rsdbd.service`
-- `deploy-tizen.sh`
-
-Use `scripts/deploy-tizen.sh` and the default service file from `packaging/systemd/rsdbd.service`. The service starts `rsdbd` on `0.0.0.0:27101`.
-The daemon auto-detects its discovery name and platform on the target device.
-
-You can use any transport you want for that copy step: `scp`, `sdb`, removable media, or your own tooling.
-
-Then, on the Tizen target device itself, run:
+This produces an RPM under:
 
 ```bash
-chmod +x ./deploy-tizen.sh
-sudo ./deploy-tizen.sh
+target/packages/rpm/aarch64/RPMS/aarch64/
 ```
 
-The default current-directory inputs are:
+The build script accepts:
 
-- `./rsdbd`
-- `./rsdbd.service`
+- `aarch64`
+- `armv7l`
 
-The script installs:
+On some Ubuntu hosts, `rpmbuild` may reject `armv7l` RPM emission even though `cargo tizen build -A armv7l` succeeds. In that case the script still verifies the daemon binary build and exits with a clear packaging error.
 
-- binary to `/usr/bin/rsdbd`
-- service file to `/usr/lib/systemd/system/rsdbd.service`
-- environment file to `/etc/rsdbd.env` on first install with `RUST_LOG=debug`
-- environment file default `RSDB_LOG_FILE=/var/log/rsdbd.log`
-- log output to `/var/log/rsdbd.log`
+If you omit the argument, it uses the repo defaults from `.cargo-tizen.toml`:
 
-If the service is already active, it stops it before reinstalling and then restarts it.
-After restart, the script prints service status and recent logs so you can confirm the daemon came back successfully.
-If you need different paths, edit the variables at the top of `scripts/deploy-tizen.sh`.
+```toml
+[default]
+arch = "aarch64"
+profile = "tizen"
+platform_version = "10.0"
+provider = "rootstrap"
+```
+
+Copy the RPM to the target device and install or upgrade it:
+
+```bash
+rpm -Uvh rsdbd-*.aarch64.rpm
+```
+
+The RPM handles:
+
+- installing `/usr/bin/rsdbd`
+- installing `/usr/lib/systemd/system/rsdbd.service`
+- installing `/etc/rsdbd.env` as a preserved config file
+- creating `/var/log/rsdbd.log` if needed
+- stopping the old service during upgrade
+- `systemctl daemon-reload`
+- `systemctl enable rsdbd.service`
+- `systemctl restart rsdbd.service`
+
+If you already changed `/etc/rsdbd.env` on the device, RPM keeps your existing file during upgrade.
+
 If everything works and you want quiet operation, change `RUST_LOG=debug` to `RUST_LOG=off` in `/etc/rsdbd.env` and restart `rsdbd.service`.
+
+### Development fallback
+
+For ad-hoc local testing on the target, `scripts/deploy-tizen.sh` is still available as a manual fallback.
 
 ## Build
 
@@ -112,13 +128,13 @@ Discover devices on the local network or local loopback:
 rsdb discover
 ```
 
-Connect and save a target:
+Connect and make a target current:
 
 ```bash
-rsdb connect 192.168.0.42:27101 --name tv-lab
+rsdb connect 192.168.0.42
 ```
 
-List saved targets:
+List saved targets and show the current one:
 
 ```bash
 rsdb devices
@@ -127,37 +143,37 @@ rsdb devices
 Read daemon capabilities:
 
 ```bash
-rsdb capability --target tv-lab
+rsdb capability
 ```
 
 Open an interactive target shell:
 
 ```bash
-rsdb shell --target tv-lab
+rsdb shell
 ```
 
 Run a command through the target shell:
 
 ```bash
-rsdb shell --target tv-lab uname -a
+rsdb shell uname -a
 ```
 
 Push a file to the target:
 
 ```bash
-rsdb push --target tv-lab ./local.txt /tmp/remote.txt
+rsdb push ./local.txt /tmp/remote.txt
 ```
 
 Pull a file from the target:
 
 ```bash
-rsdb pull --target tv-lab /tmp/remote.txt ./remote.txt
+rsdb pull /tmp/remote.txt ./remote.txt
 ```
 
 Ping a target:
 
 ```bash
-rsdb ping --target tv-lab
+rsdb ping
 ```
 
 ## Logging
@@ -168,7 +184,7 @@ Enable logs only when debugging:
 
 ```bash
 RUST_LOG=debug rsdb discover
-RUST_LOG=debug rsdb shell --target tv-lab
+RUST_LOG=debug rsdb shell
 RUST_LOG=debug rsdbd --listen 0.0.0.0:27101
 RUST_LOG=trace rsdbd --listen 0.0.0.0:27101
 ```
@@ -183,6 +199,8 @@ RUST_LOG=trace rsdbd --listen 0.0.0.0:27101
   - target daemon
 - `packaging/systemd`
   - service unit
+- `packaging/rpm`
+  - RPM packaging assets
 - `scripts`
   - deployment helpers
 
@@ -191,4 +209,3 @@ RUST_LOG=trace rsdbd --listen 0.0.0.0:27101
 - `rsdb discover` assumes one daemon per target device on port `27101`
 - multiple devices can use the same port because they are identified by different IP addresses
 - for local development, `discover` also probes loopback so `127.0.0.1:27101` can be found
-- the longer design and research notes are in [RESEARCH_AND_PLAN.md](./RESEARCH_AND_PLAN.md)
