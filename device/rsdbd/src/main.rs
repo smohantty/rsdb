@@ -530,8 +530,9 @@ async fn handle_pull(stream: &mut TcpStream, request_id: u32, path: &str) -> Res
         .with_context(|| format!("failed to open remote path for read: {path}"))?;
     let mode = file_mode(&file_meta);
 
+    let mut writer = tokio::io::BufWriter::new(&mut *stream);
     write_json_frame(
-        stream,
+        &mut writer,
         FrameKind::Response,
         request_id,
         &ControlResponse::PullMetadata {
@@ -551,7 +552,7 @@ async fn handle_pull(stream: &mut TcpStream, request_id: u32, path: &str) -> Res
 
         bytes_sent += read as u64;
         write_stream_frame(
-            stream,
+            &mut writer,
             request_id,
             StreamChannel::File,
             false,
@@ -560,9 +561,9 @@ async fn handle_pull(stream: &mut TcpStream, request_id: u32, path: &str) -> Res
         .await?;
     }
 
-    write_stream_frame(stream, request_id, StreamChannel::File, true, &[]).await?;
+    write_stream_frame(&mut writer, request_id, StreamChannel::File, true, &[]).await?;
     write_json_frame(
-        stream,
+        &mut writer,
         FrameKind::Response,
         request_id,
         &ControlResponse::PullComplete { bytes_sent },
@@ -890,6 +891,7 @@ async fn stream_batch_files(
     request_id: u32,
     files: &[BatchFileSource],
 ) -> Result<u64> {
+    let mut writer = tokio::io::BufWriter::new(&mut *stream);
     let mut buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
     let mut total_bytes = 0_u64;
 
@@ -908,7 +910,7 @@ async fn stream_batch_files(
             }
 
             write_stream_frame(
-                stream,
+                &mut writer,
                 request_id,
                 StreamChannel::File,
                 false,
