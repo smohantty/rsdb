@@ -179,9 +179,13 @@ async fn connect_command(addr: &str, requested_name: Option<&str>) -> Result<()>
         );
     }
 
-    let name = requested_name
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| default_name(&addr));
+    let name = if let Some(name) = requested_name {
+        name.to_owned()
+    } else {
+        discovered_device_name(&addr, 500)
+            .await
+            .unwrap_or_else(|| default_name(&addr))
+    };
     let registry = Registry {
         targets: vec![StoredTarget {
             name: name.clone(),
@@ -216,18 +220,30 @@ fn disconnect_command(name: Option<&str>) -> Result<()> {
 }
 
 async fn devices_command() -> Result<()> {
-    let registry = load_registry()?;
-    let Some(target) = primary_target(&registry).cloned() else {
+    let mut registry = load_registry()?;
+    let Some(mut target) = primary_target(&registry).cloned() else {
         println!("no saved devices");
         return Ok(());
     };
 
+    let mut display_name = target.name.clone();
+    if is_legacy_auto_name(&target.name, &target.addr)
+        && let Some(discovered_name) = discovered_device_name(&target.addr, 300).await
+    {
+        display_name = discovered_name.clone();
+        if discovered_name != target.name {
+            target.name = discovered_name.clone();
+            registry.targets = vec![target.clone()];
+            registry.current_target = Some(discovered_name);
+            save_registry(&registry)?;
+        }
+    }
     let status = match request(&target.addr, ControlRequest::Ping).await {
         Ok(ControlResponse::Pong { server_id, .. }) => format!("online ({server_id})"),
         Ok(other) => format!("unexpected ({other:?})"),
         Err(err) => format!("offline ({err})"),
     };
-    println!("{}\t{}\t{}", target.name, target.addr, status);
+    println!("{}\t{}\t{}", display_name, target.addr, status);
     Ok(())
 }
 
@@ -277,6 +293,71 @@ async fn discover_targets(
     }
 
     Ok(discovered.into_values().collect())
+}
+
+async fn discover_target_at(addr: &str, timeout_ms: u64) -> Result<Option<DiscoveredTarget>> {
+    let mut destinations = tokio::net::lookup_host(addr)
+        .await
+        .with_context(|| format!("failed to resolve discovery target {addr}"))?;
+    let destination = destinations
+        .next()
+        .ok_or_else(|| anyhow!("no socket addresses resolved for {addr}"))?;
+    let bind_addr = match destination {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+    let socket = UdpSocket::bind(bind_addr)
+        .await
+        .with_context(|| format!("failed to bind discovery socket on {bind_addr}"))?;
+
+    let nonce = discovery_nonce();
+    let request = DiscoveryRequest::Probe { nonce };
+    let payload = encode_discovery_message(&request).context("failed to encode discovery probe")?;
+    socket
+        .send_to(&payload, destination)
+        .await
+        .with_context(|| format!("failed to send discovery probe to {destination}"))?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let mut buffer = vec![0_u8; MAX_DISCOVERY_PAYLOAD_LEN + rsdb_proto::DISCOVERY_MAGIC.len()];
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+
+        let remaining = deadline - now;
+        let received = timeout(remaining, socket.recv_from(&mut buffer)).await;
+        let (len, peer) = match received {
+            Ok(Ok(packet)) => packet,
+            Ok(Err(err)) => return Err(err).context("failed to receive discovery response"),
+            Err(_) => return Ok(None),
+        };
+
+        let response: DiscoveryResponse = match decode_discovery_message(&buffer[..len]) {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        if response.nonce != nonce {
+            continue;
+        }
+
+        return Ok(Some(DiscoveredTarget {
+            device_name: response.device_name,
+            addr: SocketAddr::new(peer.ip(), response.tcp_port),
+            platform: response.platform,
+        }));
+    }
+}
+
+async fn discovered_device_name(addr: &str, timeout_ms: u64) -> Option<String> {
+    discover_target_at(addr, timeout_ms)
+        .await
+        .ok()
+        .flatten()
+        .map(|target| target.device_name)
+        .filter(|name| !name.trim().is_empty())
 }
 
 fn discovery_probe_addresses(probe_addr: &str) -> Result<Vec<IpAddr>> {
@@ -938,6 +1019,10 @@ fn default_name(addr: &str) -> String {
             _ => '-',
         })
         .collect()
+}
+
+fn is_legacy_auto_name(name: &str, addr: &str) -> bool {
+    name == default_name(addr)
 }
 
 fn normalize_connect_addr(value: &str) -> String {
