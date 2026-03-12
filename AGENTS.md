@@ -27,3 +27,11 @@ When asked to update `rsdbd` on a development device:
    - the target architecture it detected
    - the RPM it built and pushed
    - whether the updated local CLI could talk to the restarted daemon
+
+## Regression Smoke Test
+
+When asked to regression-test RSDB shell or file transfer behavior against a device:
+
+1. Run `./scripts/test/rsdb-regression.sh` from the repo root.
+2. By default it uses the current `rsdb` target. If the user gives an explicit device address, pass it through with `--target <ip[:port]>`.
+3. Use the script result as the primary signal for push/pull and interactive shell regressions before inventing ad hoc checks.
