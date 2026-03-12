@@ -58,16 +58,20 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Save a device and make it the current target.
     Connect {
         addr: String,
         #[arg(long)]
         name: Option<String>,
     },
+    /// Remove a saved device or the current target.
     Disconnect {
         #[arg(value_name = "ADDR")]
         target: Option<String>,
     },
+    /// List saved devices and their current status.
     Devices,
+    /// Discover reachable RSDB daemons on the network.
     Discover {
         #[arg(long, default_value = "255.255.255.255")]
         probe_addr: String,
@@ -76,26 +80,31 @@ enum Commands {
         #[arg(long, default_value_t = 1000)]
         timeout_ms: u64,
     },
+    /// Check whether a target daemon responds.
     Ping {
         #[arg(long, value_name = "ADDR")]
         target: Option<String>,
     },
+    /// Print daemon protocol features for a target.
     Capability {
         #[arg(long, value_name = "ADDR")]
         target: Option<String>,
     },
+    /// Open an interactive shell or run one remote command.
     Shell {
         #[arg(long, value_name = "ADDR")]
         target: Option<String>,
         #[arg(allow_hyphen_values = true)]
         command: Vec<String>,
     },
+    /// Push local files or directories to the target.
     Push {
         #[arg(long, value_name = "ADDR")]
         target: Option<String>,
         #[arg(value_name = "PATH", required = true, num_args = 2..)]
         paths: Vec<String>,
     },
+    /// Pull remote files or directories from the target.
     Pull {
         #[arg(long, value_name = "ADDR")]
         target: Option<String>,
