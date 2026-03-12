@@ -1,0 +1,4 @@
+# Extend the host build-arch compatibility table so Ubuntu's rpmbuild can
+# package the prebuilt RSDB ARM binaries on x86_64 and aarch64 builders.
+buildarch_compat: x86_64: aarch64 armv7l noarch
+buildarch_compat: aarch64: armv7l noarch

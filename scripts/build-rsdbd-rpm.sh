@@ -6,6 +6,7 @@ CONFIG_FILE="$ROOT_DIR/.cargo-tizen.toml"
 SPEC_FILE="$ROOT_DIR/packaging/rpm/rsdbd.spec"
 SERVICE_FILE="$ROOT_DIR/packaging/systemd/rsdbd.service"
 ENV_FILE="$ROOT_DIR/packaging/rpm/rsdbd.env"
+RPMRC_FILE="$ROOT_DIR/packaging/rpm/rsdbd.rpmrc"
 
 if [[ $# -gt 1 ]]; then
     echo "usage: $0 [aarch64|armv7l]" >&2
@@ -26,6 +27,11 @@ fi
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
     echo "error: cargo-tizen config not found: $CONFIG_FILE" >&2
+    exit 1
+fi
+
+if [[ ! -f "$RPMRC_FILE" ]]; then
+    echo "error: rpmrc compatibility overrides not found: $RPMRC_FILE" >&2
     exit 1
 fi
 
@@ -94,6 +100,18 @@ PROVIDER="$(toml_value default provider)"
 PROVIDER="${PROVIDER:-rootstrap}"
 TOPDIR="$ROOT_DIR/target/packages/rpm/$RPM_ARCH"
 HOST_ARCH="$(uname -m)"
+RPMRC_FILES=(/usr/lib/rpm/rpmrc)
+
+if [[ -f /etc/rpmrc ]]; then
+    RPMRC_FILES+=(/etc/rpmrc)
+fi
+
+if [[ -n "${HOME:-}" && -f "$HOME/.rpmrc" ]]; then
+    RPMRC_FILES+=("$HOME/.rpmrc")
+fi
+
+RPMRC_FILES+=("$RPMRC_FILE")
+RPMRC_PATH="$(IFS=:; echo "${RPMRC_FILES[*]}")"
 
 echo "Building rsdbd for Tizen arch=$ARCH profile=$PROFILE_NAME platform_version=$PLATFORM_VERSION provider=$PROVIDER"
 (
@@ -117,6 +135,7 @@ cp "$SPEC_FILE" "$TOPDIR/SPECS/rsdbd.spec"
 
 RPMBUILD_ARGS=(
     -bb \
+    --rcfile "$RPMRC_PATH"
     --target "$RPM_ARCH"
     --define "_topdir $TOPDIR"
     --define "_build_id_links none"
@@ -135,9 +154,9 @@ fi
 RPMBUILD_ARGS+=("$TOPDIR/SPECS/rsdbd.spec")
 
 if ! rpmbuild "${RPMBUILD_ARGS[@]}"; then
-    if [[ "$ARCH" == "armv7l" ]]; then
-        echo "error: rpmbuild rejected target arch $RPM_ARCH on this host. The armv7l daemon binary was built successfully, but this host RPM toolchain cannot emit an armv7l RPM." >&2
-    fi
+    echo "error: rpmbuild rejected target arch $RPM_ARCH on this host." >&2
+    echo "error: checked with rpmrc overrides from $RPMRC_FILE." >&2
+    echo "next check: rpmbuild --rcfile \"$RPMRC_PATH\" --showrc | sed -n '1,12p'" >&2
     exit 1
 fi
 
