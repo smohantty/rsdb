@@ -69,6 +69,12 @@ The build script accepts:
 - `aarch64`
 - `armv7l`
 
+Refresh the matching GitHub release with both RPMs:
+
+```bash
+./scripts/release-rsdb.sh
+```
+
 On some Ubuntu hosts, `rpmbuild` may reject `armv7l` RPM emission even though `cargo tizen build -A armv7l` succeeds. In that case the script still verifies the daemon binary build and exits with a clear packaging error.
 
 If you omit the argument, it uses the repo defaults from `.cargo-tizen.toml`:
@@ -101,10 +107,6 @@ The RPM handles:
 If you already changed `/etc/rsdbd.env` on the device, RPM keeps your existing file during upgrade.
 
 If everything works and you want quiet operation, change `RUST_LOG=debug` to `RUST_LOG=off` in `/etc/rsdbd.env` and restart `rsdbd.service`.
-
-### Development fallback
-
-For ad-hoc local testing on the target, `scripts/deploy-tizen.sh` is still available as a manual fallback.
 
 ## Build
 
@@ -213,7 +215,7 @@ RUST_LOG=trace rsdbd --listen 0.0.0.0:27101
 - `packaging/rpm`
   - RPM packaging assets
 - `scripts`
-  - deployment helpers
+  - build and release helpers
 
 ## Notes
 

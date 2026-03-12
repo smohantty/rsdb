@@ -40,7 +40,29 @@ fi
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable rsdbd.service >/dev/null 2>&1 || true
-    systemctl restart rsdbd.service >/dev/null 2>&1 || true
+    if systemctl restart rsdbd.service >/dev/null 2>&1; then
+        rsdbd_active=0
+        for _ in 1 2 3 4 5; do
+            if systemctl is-active --quiet rsdbd.service; then
+                rsdbd_active=1
+                break
+            fi
+            sleep 1
+        done
+        if [ "$rsdbd_active" -eq 1 ]; then
+            echo "rsdbd.service restarted and is active"
+        else
+            echo "warning: rsdbd.service did not become active within 5 seconds after install"
+            echo "check status: systemctl status rsdbd.service --no-pager -l"
+            echo "check journal: journalctl -u rsdbd.service -n 100 --no-pager"
+            echo "check file log: tail -n 100 /var/log/rsdbd.log"
+        fi
+    else
+        echo "warning: systemctl restart rsdbd.service failed during install"
+        echo "check status: systemctl status rsdbd.service --no-pager -l"
+        echo "check journal: journalctl -u rsdbd.service -n 100 --no-pager"
+        echo "check file log: tail -n 100 /var/log/rsdbd.log"
+    fi
 fi
 
 %preun
