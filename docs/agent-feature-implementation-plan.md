@@ -61,7 +61,7 @@ Use one machine-facing shape:
 
 ```text
 rsdb agent discover [--probe-addr <addr>] [--port <port>] [--timeout-ms <n>]
-rsdb agent --target <addr> exec [flags] -- <command> [args...]
+rsdb agent --target <addr> exec [flags] [--stream] -- <command> [args...]
 rsdb agent --target <addr> fs stat <path> [flags]
 rsdb agent --target <addr> fs list <path> [flags]
 rsdb agent --target <addr> fs read <path> [flags]
@@ -126,6 +126,7 @@ Contract rules:
 - `stderr` is reserved for transport diagnostics only
 - optional command fields should be present as `null` when unknown
 - command-specific payloads live inside `data`
+- `exec --stream` is the first explicit exception to the single-document rule and must emit machine-readable JSON events on stdout until completion
 
 ## Minimum subcommand semantics
 
@@ -166,6 +167,7 @@ Purpose:
 
 Phase 0 flags:
 
+- `--stream`
 - `--cwd <path>` is deferred
 - `--env KEY=VALUE` is deferred
 - `--stdin-file <path>` is deferred
@@ -176,7 +178,15 @@ Phase 0 must:
 
 - use `ControlRequest::Exec`
 - never call `shell` for one-shot command execution
+- support `--stream` for incremental stdout and stderr delivery from direct process execution
 - return `status`, `stdout`, `stderr`, `duration_ms`, and `timed_out`
+
+When `--stream` is set:
+
+- stdout remains machine-readable by emitting JSONL events rather than raw process bytes
+- event records should distinguish `stdout`, `stderr`, and terminal completion
+- the final event should include at least `status`, `duration_ms`, and `timed_out`
+- the command should not require shell syntax just to get live output
 
 Phase 1 extends:
 
@@ -403,6 +413,7 @@ Deliver:
 
 - `rsdb agent discover`
 - `rsdb agent exec`
+- `rsdb agent exec --stream`
 - agent JSON envelope
 - explicit target resolution for target-scoped operations
 - JSON output for `agent transfer push/pull`
@@ -412,12 +423,13 @@ Do not block phase 0 on:
 
 - daemon fs protocol work
 - expanded protocol error enums
-- event streaming
+- event streaming beyond `agent exec --stream`
 
 Exit criteria:
 
 - an autonomous agent can start with `discover` when no target is known
 - run remote commands with `exec`
+- stream long-running command output with `exec --stream`
 - push and pull artifacts through `agent transfer`
 - do all of that without using top-level human commands
 
@@ -525,6 +537,7 @@ CLI tests:
 - add tests that each `rsdb agent` path emits only the JSON envelope
 - add tests that `rsdb agent` never uses registry fallback
 - add tests that `agent exec --check` maps nonzero exit to `exec.nonzero`
+- add tests that `agent exec --stream` emits JSONL events and a final completion event
 
 Daemon tests:
 
@@ -533,7 +546,7 @@ Daemon tests:
 Integration tests:
 
 - add a new script at `scripts/test/rsdb-agent-regression.sh`
-- validate `discover`, `exec`, `fs stat`, `fs read`, `fs write`, `fs move`, and `transfer push/pull`
+- validate `discover`, `exec`, `exec --stream`, `fs stat`, `fs read`, `fs write`, `fs move`, and `transfer push/pull`
 - include at least one conflict case for `fs write --if-sha256`
 
 Skill/wrapper tests:
@@ -545,13 +558,14 @@ Skill/wrapper tests:
 1. Add CLI `agent` subcommand, JSON envelope, and explicit target handling.
 2. Implement `agent discover` by wrapping the existing discovery response.
 3. Implement `agent exec` on the existing `Exec` request.
-4. Add JSON `agent transfer push/pull` wrappers.
-5. Expand protocol types for fs operations.
-6. Implement daemon fs handlers and capability advertisement.
-7. Implement CLI `fs` commands.
-8. Add verified transfer semantics.
-9. Add the new regression script.
-10. Add or update the skill or tool prompt that teaches the minimum playbook.
+4. Extend `agent exec` with `--stream` on the direct process path.
+5. Add JSON `agent transfer push/pull` wrappers.
+6. Expand protocol types for fs operations.
+7. Implement daemon fs handlers and capability advertisement.
+8. Implement CLI `fs` commands.
+9. Add verified transfer semantics.
+10. Add the new regression script.
+11. Add or update the skill or tool prompt that teaches the minimum playbook.
 
 ## Done definition
 
@@ -561,5 +575,6 @@ This feature set is done when all of the following are true:
 - the surface is usable without top-level human commands
 - the daemon advertises versioned agent capabilities for implemented remote features
 - the CLI emits stable agent JSON envelopes for every command
+- `agent exec --stream` supports incremental machine-readable output for long-running commands
 - a wrapper skill can teach the entire contract in a short operation list
 - regression coverage exists for both protocol and end-to-end behavior
