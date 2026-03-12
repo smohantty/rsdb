@@ -1,27 +1,32 @@
+use base64::Engine as _;
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt;
 use std::fs;
 use std::io::IsTerminal as _;
 use std::io::Read as _;
+use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
 use glob::{MatchOptions, glob_with};
 use rsdb_proto::{
-    CapabilitySet, ControlRequest, ControlResponse, DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest, HEADER_LEN,
-    DiscoveryResponse, FrameKind, MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION, StreamChannel,
+    AgentFsEntry, AgentFsStat, CapabilitySet, ContentEncoding, ControlRequest, ControlResponse,
+    DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest, DiscoveryResponse, FrameKind, FsEntryKind,
+    HEADER_LEN, HashAlgorithm, MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION, StreamChannel,
     TransferEntry, TransferEntryKind, TransferRoot, decode_discovery_message, decode_json,
     decode_stream_frame, encode_discovery_message, read_frame, write_json_frame,
     write_stream_frame,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -111,6 +116,156 @@ enum Commands {
         #[arg(value_name = "PATH", required = true, num_args = 2..)]
         paths: Vec<String>,
     },
+    /// Machine-facing agent command surface.
+    Agent {
+        #[arg(long, global = true, value_name = "ADDR")]
+        target: Option<String>,
+        #[command(subcommand)]
+        command: AgentCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentCommands {
+    /// Print the machine-readable agent command schema as JSON.
+    Schema,
+    /// Discover reachable RSDB daemons for autonomous agents.
+    Discover {
+        #[arg(long, default_value = "255.255.255.255")]
+        probe_addr: String,
+        #[arg(long, default_value_t = DEFAULT_RSDB_PORT)]
+        port: u16,
+        #[arg(long, default_value_t = 1000)]
+        timeout_ms: u64,
+    },
+    /// Execute one direct remote process with JSON output.
+    Exec {
+        #[arg(long)]
+        stream: bool,
+        #[arg(long)]
+        check: bool,
+        #[arg(
+            value_name = "COMMAND",
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        command: Vec<String>,
+    },
+    /// Small structured remote filesystem operations.
+    Fs {
+        #[command(subcommand)]
+        command: AgentFsCommands,
+    },
+    /// Bulk transfer files or directories with JSON output.
+    Transfer {
+        #[command(subcommand)]
+        command: AgentTransferCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentFsCommands {
+    Stat {
+        path: String,
+        #[arg(long)]
+        hash: Option<CliHashAlgorithm>,
+    },
+    List {
+        path: String,
+        #[arg(long)]
+        recursive: bool,
+        #[arg(long)]
+        max_depth: Option<u32>,
+        #[arg(long)]
+        include_hidden: bool,
+        #[arg(long)]
+        hash: Option<CliHashAlgorithm>,
+    },
+    Read {
+        path: String,
+        #[arg(long, default_value = "utf8")]
+        encoding: CliContentEncoding,
+        #[arg(long)]
+        max_bytes: Option<u64>,
+    },
+    Write {
+        path: String,
+        #[arg(long)]
+        input_file: Option<String>,
+        #[arg(long)]
+        stdin: bool,
+        #[arg(long, default_value = "utf8")]
+        encoding: CliContentEncoding,
+        #[arg(long)]
+        mode: Option<String>,
+        #[arg(long)]
+        create_parent: bool,
+        #[arg(long)]
+        atomic: bool,
+        #[arg(long)]
+        if_missing: bool,
+        #[arg(long)]
+        if_sha256: Option<String>,
+    },
+    Mkdir {
+        path: String,
+        #[arg(long)]
+        parents: bool,
+        #[arg(long)]
+        mode: Option<String>,
+    },
+    Rm {
+        path: String,
+        #[arg(long)]
+        recursive: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        if_exists: bool,
+    },
+    Move {
+        source: String,
+        destination: String,
+        #[arg(long)]
+        overwrite: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentTransferCommands {
+    Push {
+        #[arg(long)]
+        verify: Option<CliTransferVerifyMode>,
+        #[arg(long)]
+        atomic: bool,
+        #[arg(long)]
+        if_changed: bool,
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
+    },
+    Pull {
+        #[arg(long)]
+        verify: Option<CliTransferVerifyMode>,
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliHashAlgorithm {
+    Sha256,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliContentEncoding {
+    Utf8,
+    Base64,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliTransferVerifyMode {
+    Size,
+    Sha256,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,10 +283,12 @@ struct Registry {
 
 #[derive(Debug, Clone)]
 struct DiscoveredTarget {
+    server_id: String,
     device_name: String,
     addr: SocketAddr,
     platform: String,
     protocol_version: u16,
+    features: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,32 +305,247 @@ struct LocalBatchManifest {
     total_bytes: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct AgentEnvelope<T> {
+    schema_version: &'static str,
+    command: String,
+    ok: bool,
+    data: Option<T>,
+    error: Option<AgentErrorBody>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentEventEnvelope<T> {
+    schema_version: &'static str,
+    command: &'static str,
+    event: &'static str,
+    data: Option<T>,
+    error: Option<AgentErrorBody>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentErrorBody {
+    code: String,
+    message: String,
+    target: Option<String>,
+    retryable: bool,
+    details: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct AgentCommandFailure {
+    code: String,
+    message: String,
+    target: Option<String>,
+    retryable: bool,
+    details: serde_json::Value,
+    exit_code: i32,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentDiscoverData {
+    targets: Vec<AgentDiscoverTarget>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentDiscoverTarget {
+    target: String,
+    server_id: String,
+    device_name: Option<String>,
+    platform: Option<String>,
+    protocol_version: u16,
+    compatible: bool,
+    supported_operations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentSchemaData {
+    usage_rules: Vec<String>,
+    operations: Vec<AgentSchemaOperation>,
+    target_required_for: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentSchemaOperation {
+    name: String,
+    purpose: String,
+    target_required: bool,
+    options: Vec<AgentSchemaOption>,
+    positional: Vec<AgentSchemaPositional>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentSchemaOption {
+    name: String,
+    kind: String,
+    required: bool,
+    takes_value: bool,
+    multiple: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentSchemaPositional {
+    name: String,
+    kind: String,
+    required: bool,
+    multiple: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentExecData {
+    target: String,
+    command: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    status: i32,
+    timed_out: bool,
+    stdout: String,
+    stderr: String,
+    duration_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentExecChunkData {
+    target: String,
+    chunk: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentExecCompletionData {
+    target: String,
+    command: String,
+    args: Vec<String>,
+    status: i32,
+    timed_out: bool,
+    duration_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentTransferPushData {
+    target: String,
+    sources: Vec<String>,
+    destination: String,
+    entries_written: u64,
+    bytes_written: u64,
+    skipped: bool,
+    verification: Option<String>,
+    verified: bool,
+    atomic: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentTransferPullData {
+    target: String,
+    sources: Vec<String>,
+    destination: String,
+    entries_received: u64,
+    bytes_received: u64,
+    total_bytes: u64,
+    verification: Option<String>,
+    verified: bool,
+}
+
+#[derive(Debug)]
+struct PushSummary {
+    entries_written: u64,
+    bytes_written: u64,
+    skipped: bool,
+    verification: Option<String>,
+    verified: bool,
+}
+
+#[derive(Debug)]
+struct PullSummary {
+    entries_received: u64,
+    bytes_received: u64,
+    total_bytes: u64,
+    verification: Option<String>,
+    verified: bool,
+    roots: Vec<TransferRoot>,
+    entries: Vec<TransferEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentFsListData {
+    entries: Vec<AgentFsEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TransferPathState {
+    kind: FsEntryKind,
+    size: Option<u64>,
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteControlError {
+    code: rsdb_proto::ErrorCode,
+    message: String,
+}
+
+impl fmt::Display for RemoteControlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "remote error {:?}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for RemoteControlError {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
 
-    match cli.command {
-        Commands::Connect { addr, name } => connect_command(&addr, name.as_deref()).await,
-        Commands::Disconnect { target } => disconnect_command(target.as_deref()),
-        Commands::Devices => devices_command().await,
+    let exit_code = match cli.command {
+        Commands::Connect { addr, name } => {
+            connect_command(&addr, name.as_deref()).await?;
+            0
+        }
+        Commands::Disconnect { target } => {
+            disconnect_command(target.as_deref())?;
+            0
+        }
+        Commands::Devices => {
+            devices_command().await?;
+            0
+        }
         Commands::Discover {
             probe_addr,
             port,
             timeout_ms,
-        } => discover_command(&probe_addr, port, timeout_ms).await,
-        Commands::Ping { target } => ping_command(target.as_deref()).await,
-        Commands::Capability { target } => capability_command(target.as_deref()).await,
-        Commands::Shell { target, command } => shell_command(target.as_deref(), &command).await,
+        } => {
+            discover_command(&probe_addr, port, timeout_ms).await?;
+            0
+        }
+        Commands::Ping { target } => {
+            ping_command(target.as_deref()).await?;
+            0
+        }
+        Commands::Capability { target } => {
+            capability_command(target.as_deref()).await?;
+            0
+        }
+        Commands::Shell { target, command } => {
+            shell_command(target.as_deref(), &command).await?;
+            0
+        }
         Commands::Push { target, paths } => {
             let (sources, destination) = split_sources_and_destination(&paths, "push")?;
-            push_command(target.as_deref(), &sources, &destination).await
+            push_command(target.as_deref(), &sources, &destination).await?;
+            0
         }
         Commands::Pull { target, paths } => {
             let (sources, destination) = split_sources_and_destination(&paths, "pull")?;
-            pull_command(target.as_deref(), &sources, &destination).await
+            pull_command(target.as_deref(), &sources, &destination).await?;
+            0
         }
+        Commands::Agent { target, command } => agent_command(target.as_deref(), command).await?,
+    };
+
+    if exit_code != 0 {
+        std::process::exit(normalize_exit_status(exit_code));
     }
+    Ok(())
 }
 
 fn init_tracing() {
@@ -483,10 +855,12 @@ async fn discover_target_at(addr: &str, timeout_ms: u64) -> Result<Option<Discov
         }
 
         return Ok(Some(DiscoveredTarget {
+            server_id: response.server_id,
             device_name: response.device_name,
             addr: SocketAddr::new(peer.ip(), response.tcp_port),
             platform: response.platform,
             protocol_version: response.protocol_version,
+            features: response.features,
         }));
     }
 }
@@ -560,15 +934,2220 @@ async fn discover_targets_once(
         discovered.insert(
             key,
             DiscoveredTarget {
+                server_id: response.server_id,
                 device_name: response.device_name,
                 addr,
                 platform: response.platform,
                 protocol_version: response.protocol_version,
+                features: response.features,
             },
         );
     }
 
     Ok(discovered.into_values().collect())
+}
+
+type AgentResult<T> = std::result::Result<T, AgentCommandFailure>;
+
+async fn agent_command(target: Option<&str>, command: AgentCommands) -> Result<i32> {
+    match command {
+        AgentCommands::Schema => agent_schema_command(target).await,
+        AgentCommands::Discover {
+            probe_addr,
+            port,
+            timeout_ms,
+        } => agent_discover_command(target, &probe_addr, port, timeout_ms).await,
+        AgentCommands::Exec {
+            stream,
+            check,
+            command,
+        } => agent_exec_command(target, stream, check, &command).await,
+        AgentCommands::Fs { command } => agent_fs_command(target, command).await,
+        AgentCommands::Transfer { command } => agent_transfer_command(target, command).await,
+    }
+}
+
+async fn agent_schema_command(target: Option<&str>) -> Result<i32> {
+    if target.is_some() {
+        return emit_agent_failure(
+            "schema",
+            invalid_request_failure(
+                "schema does not accept --target",
+                None,
+                serde_json::json!({"field": "target"}),
+            ),
+        );
+    }
+
+    emit_agent_success("schema", agent_schema())?;
+    Ok(0)
+}
+
+async fn agent_discover_command(
+    target: Option<&str>,
+    probe_addr: &str,
+    port: u16,
+    timeout_ms: u64,
+) -> Result<i32> {
+    if target.is_some() {
+        return emit_agent_failure(
+            "discover",
+            invalid_request_failure(
+                "discover does not accept --target",
+                None,
+                serde_json::json!({"field": "target"}),
+            ),
+        );
+    }
+
+    let targets = match discover_targets(probe_addr, port, timeout_ms).await {
+        Ok(targets) => targets,
+        Err(err) => {
+            return emit_agent_failure("discover", map_transport_error("discover", None, &err));
+        }
+    };
+
+    let data = AgentDiscoverData {
+        targets: targets
+            .into_iter()
+            .map(|target| {
+                let compatible = target.protocol_version == PROTOCOL_VERSION;
+                AgentDiscoverTarget {
+                    target: target.addr.to_string(),
+                    server_id: target.server_id,
+                    device_name: Some(target.device_name),
+                    platform: Some(target.platform),
+                    protocol_version: target.protocol_version,
+                    compatible,
+                    supported_operations: supported_agent_operations(&target.features, compatible),
+                }
+            })
+            .collect(),
+    };
+    emit_agent_success("discover", data)?;
+    Ok(0)
+}
+
+async fn agent_exec_command(
+    target: Option<&str>,
+    stream: bool,
+    check: bool,
+    command: &[String],
+) -> Result<i32> {
+    let target = match require_agent_target(target) {
+        Ok(target) => target,
+        Err(err) => return emit_agent_failure("exec", err),
+    };
+
+    let (program, args) = match command.split_first() {
+        Some((program, args)) => (program.clone(), args.to_vec()),
+        None => {
+            return emit_agent_failure(
+                "exec",
+                invalid_request_failure(
+                    "exec requires a command after `--`",
+                    Some(target),
+                    serde_json::json!({"field": "command"}),
+                ),
+            );
+        }
+    };
+
+    let exit_code = if stream {
+        match run_agent_exec_stream(&target, &program, &args, check).await {
+            Ok(code) => code,
+            Err(err) => return emit_agent_failure("exec", err),
+        }
+    } else {
+        match run_agent_exec(&target, &program, &args, check).await {
+            Ok(code) => code,
+            Err(err) => return emit_agent_failure("exec", err),
+        }
+    };
+    Ok(exit_code)
+}
+
+async fn agent_transfer_command(
+    target: Option<&str>,
+    command: AgentTransferCommands,
+) -> Result<i32> {
+    match command {
+        AgentTransferCommands::Push {
+            verify,
+            atomic,
+            if_changed,
+            paths,
+        } => agent_transfer_push_command(target, &paths, verify, atomic, if_changed).await,
+        AgentTransferCommands::Pull { verify, paths } => {
+            agent_transfer_pull_command(target, &paths, verify).await
+        }
+    }
+}
+
+async fn agent_fs_command(target: Option<&str>, command: AgentFsCommands) -> Result<i32> {
+    match command {
+        AgentFsCommands::Stat { path, hash } => agent_fs_stat_command(target, &path, hash).await,
+        AgentFsCommands::List {
+            path,
+            recursive,
+            max_depth,
+            include_hidden,
+            hash,
+        } => agent_fs_list_command(target, &path, recursive, max_depth, include_hidden, hash).await,
+        AgentFsCommands::Read {
+            path,
+            encoding,
+            max_bytes,
+        } => agent_fs_read_command(target, &path, encoding, max_bytes).await,
+        AgentFsCommands::Write {
+            path,
+            input_file,
+            stdin,
+            encoding,
+            mode,
+            create_parent,
+            atomic,
+            if_missing,
+            if_sha256,
+        } => {
+            agent_fs_write_command(
+                target,
+                &path,
+                input_file.as_deref(),
+                stdin,
+                encoding,
+                mode.as_deref(),
+                create_parent,
+                atomic,
+                if_missing,
+                if_sha256.as_deref(),
+            )
+            .await
+        }
+        AgentFsCommands::Mkdir {
+            path,
+            parents,
+            mode,
+        } => agent_fs_mkdir_command(target, &path, parents, mode.as_deref()).await,
+        AgentFsCommands::Rm {
+            path,
+            recursive,
+            force,
+            if_exists,
+        } => agent_fs_rm_command(target, &path, recursive, force, if_exists).await,
+        AgentFsCommands::Move {
+            source,
+            destination,
+            overwrite,
+        } => agent_fs_move_command(target, &source, &destination, overwrite).await,
+    }
+}
+
+async fn agent_transfer_push_command(
+    target: Option<&str>,
+    paths: &[String],
+    verify: Option<CliTransferVerifyMode>,
+    atomic: bool,
+    if_changed: bool,
+) -> Result<i32> {
+    let target = match require_agent_target(target) {
+        Ok(target) => target,
+        Err(err) => return emit_agent_failure("transfer.push", err),
+    };
+    let (sources, destination) = match split_sources_and_destination(paths, "agent transfer push") {
+        Ok(parts) => parts,
+        Err(err) => {
+            return emit_agent_failure(
+                "transfer.push",
+                invalid_request_failure(err.to_string(), Some(target), serde_json::json!({})),
+            );
+        }
+    };
+
+    match run_agent_transfer_push(&target, &sources, &destination, verify, atomic, if_changed).await
+    {
+        Ok(summary) => {
+            emit_agent_success(
+                "transfer.push",
+                AgentTransferPushData {
+                    target,
+                    sources,
+                    destination,
+                    entries_written: summary.entries_written,
+                    bytes_written: summary.bytes_written,
+                    skipped: summary.skipped,
+                    verification: summary.verification,
+                    verified: summary.verified,
+                    atomic,
+                },
+            )?;
+            Ok(0)
+        }
+        Err(err) => emit_agent_failure("transfer.push", err),
+    }
+}
+
+async fn agent_transfer_pull_command(
+    target: Option<&str>,
+    paths: &[String],
+    verify: Option<CliTransferVerifyMode>,
+) -> Result<i32> {
+    let target = match require_agent_target(target) {
+        Ok(target) => target,
+        Err(err) => return emit_agent_failure("transfer.pull", err),
+    };
+    let (sources, destination) = match split_sources_and_destination(paths, "agent transfer pull") {
+        Ok(parts) => parts,
+        Err(err) => {
+            return emit_agent_failure(
+                "transfer.pull",
+                invalid_request_failure(err.to_string(), Some(target), serde_json::json!({})),
+            );
+        }
+    };
+
+    match run_agent_transfer_pull(&target, &sources, &destination, verify).await {
+        Ok(summary) => {
+            emit_agent_success(
+                "transfer.pull",
+                AgentTransferPullData {
+                    target,
+                    sources,
+                    destination,
+                    entries_received: summary.entries_received,
+                    bytes_received: summary.bytes_received,
+                    total_bytes: summary.total_bytes,
+                    verification: summary.verification,
+                    verified: summary.verified,
+                },
+            )?;
+            Ok(0)
+        }
+        Err(err) => emit_agent_failure("transfer.pull", err),
+    }
+}
+
+async fn run_agent_exec(
+    target: &str,
+    program: &str,
+    args: &[String],
+    check: bool,
+) -> AgentResult<i32> {
+    let started = Instant::now();
+    let response = request(
+        target,
+        ControlRequest::Exec {
+            command: program.to_string(),
+            args: args.to_vec(),
+            stream: false,
+        },
+    )
+    .await
+    .map_err(|err| map_transport_error("exec", Some(target.to_string()), &err))?;
+
+    match response {
+        ControlResponse::ExecResult {
+            status,
+            stdout,
+            stderr,
+            timed_out,
+        } => {
+            let data = AgentExecData {
+                target: target.to_string(),
+                command: program.to_string(),
+                args: args.to_vec(),
+                cwd: None,
+                status,
+                timed_out,
+                stdout,
+                stderr,
+                duration_ms: elapsed_ms(started),
+            };
+            if check && status != 0 {
+                return Err(exec_nonzero_failure(target.to_string(), &data));
+            }
+            emit_agent_success("exec", data).map_err(internal_agent_failure)?;
+            Ok(0)
+        }
+        ControlResponse::Error { code, message } => Err(map_remote_exec_error(
+            target.to_string(),
+            code,
+            message,
+            serde_json::json!({
+                "command": program,
+                "args": args,
+                "duration_ms": elapsed_ms(started),
+            }),
+        )),
+        other => Err(internal_agent_failure(anyhow!(
+            "unexpected response from daemon: {other:?}"
+        ))),
+    }
+}
+
+async fn run_agent_exec_stream(
+    target: &str,
+    program: &str,
+    args: &[String],
+    check: bool,
+) -> AgentResult<i32> {
+    let started = Instant::now();
+    let mut stream = open_connection(target)
+        .await
+        .map_err(|err| map_transport_error("exec", Some(target.to_string()), &err))?;
+    write_json_frame(
+        &mut stream,
+        FrameKind::Request,
+        REQUEST_ID,
+        &ControlRequest::Exec {
+            command: program.to_string(),
+            args: args.to_vec(),
+            stream: true,
+        },
+    )
+    .await
+    .map_err(|err| internal_agent_failure(anyhow!("failed to send exec request: {err}")))?;
+
+    loop {
+        let frame = match read_frame(&mut stream).await {
+            Ok(frame) => frame,
+            Err(err) => {
+                let failure =
+                    map_transport_error("exec", Some(target.to_string()), &anyhow!("{err}"));
+                emit_agent_event_failure::<serde_json::Value>("exec", "failed", failure, None)
+                    .map_err(internal_agent_failure)?;
+                return Ok(1);
+            }
+        };
+        match frame.header.kind {
+            FrameKind::Stream => {
+                let chunk = match decode_stream_frame(frame) {
+                    Ok(chunk) => chunk,
+                    Err(err) => {
+                        emit_agent_event_failure::<serde_json::Value>(
+                            "exec",
+                            "failed",
+                            internal_agent_failure(anyhow!("invalid stream frame: {err}")),
+                            None,
+                        )
+                        .map_err(internal_agent_failure)?;
+                        return Ok(1);
+                    }
+                };
+                if let Err(err) = ensure_request_id(chunk.request_id, REQUEST_ID) {
+                    emit_agent_event_failure::<serde_json::Value>(
+                        "exec",
+                        "failed",
+                        internal_agent_failure(err),
+                        None,
+                    )
+                    .map_err(internal_agent_failure)?;
+                    return Ok(1);
+                }
+                let event = match chunk.channel {
+                    StreamChannel::Stdout => Some("stdout"),
+                    StreamChannel::Stderr => Some("stderr"),
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    if !chunk.payload.is_empty() {
+                        emit_agent_event(
+                            "exec",
+                            event,
+                            Some(AgentExecChunkData {
+                                target: target.to_string(),
+                                chunk: String::from_utf8_lossy(&chunk.payload).into_owned(),
+                            }),
+                        )
+                        .map_err(internal_agent_failure)?;
+                    }
+                }
+            }
+            FrameKind::Response => {
+                let response: ControlResponse = match decode_json(&frame, FrameKind::Response) {
+                    Ok(response) => response,
+                    Err(err) => {
+                        emit_agent_event_failure::<serde_json::Value>(
+                            "exec",
+                            "failed",
+                            internal_agent_failure(anyhow!("invalid response frame: {err}")),
+                            None,
+                        )
+                        .map_err(internal_agent_failure)?;
+                        return Ok(1);
+                    }
+                };
+                match response {
+                    ControlResponse::ExecResult {
+                        status,
+                        stdout,
+                        stderr,
+                        timed_out,
+                    } => {
+                        if !stdout.is_empty() {
+                            emit_agent_event(
+                                "exec",
+                                "stdout",
+                                Some(AgentExecChunkData {
+                                    target: target.to_string(),
+                                    chunk: stdout,
+                                }),
+                            )
+                            .map_err(internal_agent_failure)?;
+                        }
+                        if !stderr.is_empty() {
+                            emit_agent_event(
+                                "exec",
+                                "stderr",
+                                Some(AgentExecChunkData {
+                                    target: target.to_string(),
+                                    chunk: stderr,
+                                }),
+                            )
+                            .map_err(internal_agent_failure)?;
+                        }
+
+                        let data = AgentExecCompletionData {
+                            target: target.to_string(),
+                            command: program.to_string(),
+                            args: args.to_vec(),
+                            status,
+                            timed_out,
+                            duration_ms: elapsed_ms(started),
+                        };
+                        if check && status != 0 {
+                            emit_agent_event_failure(
+                                "exec",
+                                "failed",
+                                exec_nonzero_failure_from_completion(target.to_string(), &data),
+                                Some(data),
+                            )
+                            .map_err(internal_agent_failure)?;
+                            return Ok(status);
+                        }
+
+                        emit_agent_event("exec", "completed", Some(data))
+                            .map_err(internal_agent_failure)?;
+                        return Ok(0);
+                    }
+                    ControlResponse::Error { code, message } => {
+                        let failure = map_remote_exec_error(
+                            target.to_string(),
+                            code,
+                            message,
+                            serde_json::json!({
+                                "command": program,
+                                "args": args,
+                                "duration_ms": elapsed_ms(started),
+                            }),
+                        );
+                        emit_agent_event_failure::<serde_json::Value>(
+                            "exec", "failed", failure, None,
+                        )
+                        .map_err(internal_agent_failure)?;
+                        return Ok(1);
+                    }
+                    other => {
+                        emit_agent_event_failure::<serde_json::Value>(
+                            "exec",
+                            "failed",
+                            internal_agent_failure(anyhow!(
+                                "unexpected response from daemon: {other:?}"
+                            )),
+                            None,
+                        )
+                        .map_err(internal_agent_failure)?;
+                        return Ok(1);
+                    }
+                }
+            }
+            other => {
+                emit_agent_event_failure::<serde_json::Value>(
+                    "exec",
+                    "failed",
+                    internal_agent_failure(anyhow!(
+                        "unexpected frame kind during exec stream: {other:?}"
+                    )),
+                    None,
+                )
+                .map_err(internal_agent_failure)?;
+                return Ok(1);
+            }
+        }
+    }
+}
+
+async fn agent_fs_stat_command(
+    target: Option<&str>,
+    path: &str,
+    hash: Option<CliHashAlgorithm>,
+) -> Result<i32> {
+    let target = match require_agent_target(target) {
+        Ok(target) => target,
+        Err(err) => return emit_agent_failure("fs.stat", err),
+    };
+    match agent_request(
+        "fs.stat",
+        &target,
+        ControlRequest::FsStat {
+            path: path.to_string(),
+            hash: hash.map(cli_hash_algorithm),
+        },
+        serde_json::json!({ "path": path }),
+    )
+    .await
+    {
+        Ok(ControlResponse::FsStat { stat }) => {
+            emit_agent_success("fs.stat", stat)?;
+            Ok(0)
+        }
+        Ok(other) => emit_agent_failure(
+            "fs.stat",
+            internal_agent_failure(anyhow!("unexpected response from daemon: {other:?}")),
+        ),
+        Err(err) => emit_agent_failure("fs.stat", err),
+    }
+}
+
+async fn agent_fs_list_command(
+    target: Option<&str>,
+    path: &str,
+    recursive: bool,
+    max_depth: Option<u32>,
+    include_hidden: bool,
+    hash: Option<CliHashAlgorithm>,
+) -> Result<i32> {
+    let target = match require_agent_target(target) {
+        Ok(target) => target,
+        Err(err) => return emit_agent_failure("fs.list", err),
+    };
+    match agent_request(
+        "fs.list",
+        &target,
+        ControlRequest::FsList {
+            path: path.to_string(),
+            recursive,
+            max_depth,
+            include_hidden,
+            hash: hash.map(cli_hash_algorithm),
+        },
+        serde_json::json!({ "path": path }),
+    )
+    .await
+    {
+        Ok(ControlResponse::FsList { entries }) => {
+            emit_agent_success("fs.list", AgentFsListData { entries })?;
+            Ok(0)
+        }
+        Ok(other) => emit_agent_failure(
+            "fs.list",
+            internal_agent_failure(anyhow!("unexpected response from daemon: {other:?}")),
+        ),
+        Err(err) => emit_agent_failure("fs.list", err),
+    }
+}
+
+async fn agent_fs_read_command(
+    target: Option<&str>,
+    path: &str,
+    encoding: CliContentEncoding,
+    max_bytes: Option<u64>,
+) -> Result<i32> {
+    let target = match require_agent_target(target) {
+        Ok(target) => target,
+        Err(err) => return emit_agent_failure("fs.read", err),
+    };
+    match agent_request(
+        "fs.read",
+        &target,
+        ControlRequest::FsRead {
+            path: path.to_string(),
+            encoding: cli_content_encoding(encoding),
+            max_bytes,
+        },
+        serde_json::json!({ "path": path }),
+    )
+    .await
+    {
+        Ok(ControlResponse::FsReadResult { result }) => {
+            emit_agent_success("fs.read", result)?;
+            Ok(0)
+        }
+        Ok(other) => emit_agent_failure(
+            "fs.read",
+            internal_agent_failure(anyhow!("unexpected response from daemon: {other:?}")),
+        ),
+        Err(err) => emit_agent_failure("fs.read", err),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn agent_fs_write_command(
+    target: Option<&str>,
+    path: &str,
+    input_file: Option<&str>,
+    stdin: bool,
+    encoding: CliContentEncoding,
+    mode: Option<&str>,
+    create_parent: bool,
+    atomic: bool,
+    if_missing: bool,
+    if_sha256: Option<&str>,
+) -> Result<i32> {
+    let target = match require_agent_target(target) {
+        Ok(target) => target,
+        Err(err) => return emit_agent_failure("fs.write", err),
+    };
+    let mode = match mode.map(parse_mode) {
+        Some(Ok(mode)) => Some(mode),
+        Some(Err(err)) => return emit_agent_failure("fs.write", err),
+        None => None,
+    };
+    let bytes = match read_fs_write_input(input_file, stdin) {
+        Ok(bytes) => bytes,
+        Err(err) => return emit_agent_failure("fs.write", err),
+    };
+    let content = match encode_local_content(&bytes, &encoding) {
+        Ok(content) => content,
+        Err(err) => return emit_agent_failure("fs.write", err),
+    };
+
+    match agent_request(
+        "fs.write",
+        &target,
+        ControlRequest::FsWrite {
+            path: path.to_string(),
+            content,
+            encoding: cli_content_encoding(encoding),
+            mode,
+            create_parent,
+            atomic,
+            if_missing,
+            if_sha256: if_sha256.map(ToOwned::to_owned),
+        },
+        serde_json::json!({ "path": path }),
+    )
+    .await
+    {
+        Ok(ControlResponse::FsWriteResult { result }) => {
+            emit_agent_success("fs.write", result)?;
+            Ok(0)
+        }
+        Ok(other) => emit_agent_failure(
+            "fs.write",
+            internal_agent_failure(anyhow!("unexpected response from daemon: {other:?}")),
+        ),
+        Err(err) => emit_agent_failure("fs.write", err),
+    }
+}
+
+async fn agent_fs_mkdir_command(
+    target: Option<&str>,
+    path: &str,
+    parents: bool,
+    mode: Option<&str>,
+) -> Result<i32> {
+    let target = match require_agent_target(target) {
+        Ok(target) => target,
+        Err(err) => return emit_agent_failure("fs.mkdir", err),
+    };
+    let mode = match mode.map(parse_mode) {
+        Some(Ok(mode)) => Some(mode),
+        Some(Err(err)) => return emit_agent_failure("fs.mkdir", err),
+        None => None,
+    };
+
+    match agent_request(
+        "fs.mkdir",
+        &target,
+        ControlRequest::FsMkdir {
+            path: path.to_string(),
+            parents,
+            mode,
+        },
+        serde_json::json!({ "path": path }),
+    )
+    .await
+    {
+        Ok(ControlResponse::FsMkdirResult { result }) => {
+            emit_agent_success("fs.mkdir", result)?;
+            Ok(0)
+        }
+        Ok(other) => emit_agent_failure(
+            "fs.mkdir",
+            internal_agent_failure(anyhow!("unexpected response from daemon: {other:?}")),
+        ),
+        Err(err) => emit_agent_failure("fs.mkdir", err),
+    }
+}
+
+async fn agent_fs_rm_command(
+    target: Option<&str>,
+    path: &str,
+    recursive: bool,
+    force: bool,
+    if_exists: bool,
+) -> Result<i32> {
+    let target = match require_agent_target(target) {
+        Ok(target) => target,
+        Err(err) => return emit_agent_failure("fs.rm", err),
+    };
+
+    match agent_request(
+        "fs.rm",
+        &target,
+        ControlRequest::FsRm {
+            path: path.to_string(),
+            recursive,
+            force,
+            if_exists,
+        },
+        serde_json::json!({ "path": path }),
+    )
+    .await
+    {
+        Ok(ControlResponse::FsRmResult { result }) => {
+            emit_agent_success("fs.rm", result)?;
+            Ok(0)
+        }
+        Ok(other) => emit_agent_failure(
+            "fs.rm",
+            internal_agent_failure(anyhow!("unexpected response from daemon: {other:?}")),
+        ),
+        Err(err) => emit_agent_failure("fs.rm", err),
+    }
+}
+
+async fn agent_fs_move_command(
+    target: Option<&str>,
+    source: &str,
+    destination: &str,
+    overwrite: bool,
+) -> Result<i32> {
+    let target = match require_agent_target(target) {
+        Ok(target) => target,
+        Err(err) => return emit_agent_failure("fs.move", err),
+    };
+
+    match agent_request(
+        "fs.move",
+        &target,
+        ControlRequest::FsMove {
+            source: source.to_string(),
+            destination: destination.to_string(),
+            overwrite,
+        },
+        serde_json::json!({ "source": source, "destination": destination }),
+    )
+    .await
+    {
+        Ok(ControlResponse::FsMoveResult { result }) => {
+            emit_agent_success("fs.move", result)?;
+            Ok(0)
+        }
+        Ok(other) => emit_agent_failure(
+            "fs.move",
+            internal_agent_failure(anyhow!("unexpected response from daemon: {other:?}")),
+        ),
+        Err(err) => emit_agent_failure("fs.move", err),
+    }
+}
+
+async fn run_agent_transfer_push(
+    target: &str,
+    source_specs: &[String],
+    destination: &str,
+    verify: Option<CliTransferVerifyMode>,
+    atomic: bool,
+    if_changed: bool,
+) -> AgentResult<PushSummary> {
+    let details = serde_json::json!({
+        "sources": source_specs,
+        "destination": destination,
+        "verify": verify.map(transfer_verify_name),
+        "atomic": atomic,
+        "if_changed": if_changed,
+    });
+    let manifest = build_local_batch_manifest(source_specs).map_err(|err| {
+        map_operation_error(
+            "transfer.push",
+            Some(target.to_string()),
+            &err,
+            details.clone(),
+        )
+    })?;
+    let expanded_sources = expand_local_sources(source_specs).map_err(|err| {
+        map_operation_error(
+            "transfer.push",
+            Some(target.to_string()),
+            &err,
+            details.clone(),
+        )
+    })?;
+    let final_root_paths = resolve_remote_batch_roots(target, destination, &manifest.roots).await?;
+
+    if !atomic && !if_changed {
+        let summary = execute_push(target, source_specs, destination)
+            .await
+            .map_err(|err| {
+                map_operation_error(
+                    "transfer.push",
+                    Some(target.to_string()),
+                    &err,
+                    details.clone(),
+                )
+            })?;
+        if let Some(mode) = verify {
+            for (source, remote_root) in expanded_sources.iter().zip(final_root_paths.iter()) {
+                let local_state = collect_local_transfer_state(source, verify_uses_hash(mode))
+                    .map_err(|err| {
+                        map_operation_error(
+                            "transfer.push",
+                            Some(target.to_string()),
+                            &err,
+                            serde_json::json!({
+                                "source": source.display().to_string(),
+                                "destination": remote_root.display().to_string(),
+                            }),
+                        )
+                    })?;
+                let remote_state =
+                    collect_remote_transfer_state(target, remote_root, verify_uses_hash(mode))
+                        .await?;
+                let verified = remote_state
+                    .as_ref()
+                    .is_some_and(|remote_state| transfer_states_match(&local_state, remote_state));
+                if !verified {
+                    return Err(transfer_verification_failure(
+                        target.to_string(),
+                        format!(
+                            "remote destination does not match pushed content: {}",
+                            remote_root.display()
+                        ),
+                        serde_json::json!({
+                            "source": source.display().to_string(),
+                            "destination": remote_root.display().to_string(),
+                            "verification": transfer_verify_name(mode),
+                        }),
+                    ));
+                }
+            }
+        }
+
+        return Ok(PushSummary {
+            entries_written: summary.entries_written,
+            bytes_written: summary.bytes_written,
+            skipped: false,
+            verification: verify.map(transfer_verify_name).map(ToOwned::to_owned),
+            verified: verify.is_some(),
+        });
+    }
+
+    let mut entries_written = 0_u64;
+    let mut bytes_written = 0_u64;
+    let mut changed_roots = 0_u64;
+
+    for (index, (source, remote_root)) in expanded_sources
+        .iter()
+        .zip(final_root_paths.iter())
+        .enumerate()
+    {
+        if if_changed {
+            let local_state = collect_local_transfer_state(source, true).map_err(|err| {
+                map_operation_error(
+                    "transfer.push",
+                    Some(target.to_string()),
+                    &err,
+                    serde_json::json!({
+                        "source": source.display().to_string(),
+                        "destination": remote_root.display().to_string(),
+                    }),
+                )
+            })?;
+            let remote_state = collect_remote_transfer_state(target, remote_root, true).await?;
+            if remote_state
+                .as_ref()
+                .is_some_and(|remote_state| transfer_states_match(&local_state, remote_state))
+            {
+                continue;
+            }
+        }
+
+        let temp_root = staged_remote_transfer_path(remote_root, index);
+        let temp_root_string = temp_root.display().to_string();
+        let final_root_string = remote_root.display().to_string();
+        let source_string = source.display().to_string();
+        let single_source = vec![source_string.clone()];
+
+        let push_result = execute_push(target, &single_source, &temp_root_string).await;
+        let push_summary = match push_result {
+            Ok(summary) => summary,
+            Err(err) => {
+                let _ = cleanup_remote_path(target, &temp_root_string).await;
+                return Err(map_operation_error(
+                    "transfer.push",
+                    Some(target.to_string()),
+                    &err,
+                    serde_json::json!({
+                        "source": source_string,
+                        "destination": final_root_string,
+                    }),
+                ));
+            }
+        };
+
+        if let Err(err) =
+            remote_fs_move_request(target, &temp_root_string, &final_root_string, true).await
+        {
+            let _ = cleanup_remote_path(target, &temp_root_string).await;
+            return Err(err);
+        }
+
+        entries_written += push_summary.entries_written;
+        bytes_written += push_summary.bytes_written;
+        changed_roots += 1;
+    }
+
+    if let Some(mode) = verify {
+        for (source, remote_root) in expanded_sources.iter().zip(final_root_paths.iter()) {
+            let local_state = collect_local_transfer_state(source, verify_uses_hash(mode))
+                .map_err(|err| {
+                    map_operation_error(
+                        "transfer.push",
+                        Some(target.to_string()),
+                        &err,
+                        serde_json::json!({
+                            "source": source.display().to_string(),
+                            "destination": remote_root.display().to_string(),
+                        }),
+                    )
+                })?;
+            let remote_state =
+                collect_remote_transfer_state(target, remote_root, verify_uses_hash(mode)).await?;
+            let verified = remote_state
+                .as_ref()
+                .is_some_and(|remote_state| transfer_states_match(&local_state, remote_state));
+            if !verified {
+                return Err(transfer_verification_failure(
+                    target.to_string(),
+                    format!(
+                        "remote destination does not match pushed content: {}",
+                        remote_root.display()
+                    ),
+                    serde_json::json!({
+                        "source": source.display().to_string(),
+                        "destination": remote_root.display().to_string(),
+                        "verification": transfer_verify_name(mode),
+                    }),
+                ));
+            }
+        }
+    }
+
+    Ok(PushSummary {
+        entries_written,
+        bytes_written,
+        skipped: if_changed && changed_roots == 0,
+        verification: verify.map(transfer_verify_name).map(ToOwned::to_owned),
+        verified: verify.is_some(),
+    })
+}
+
+async fn run_agent_transfer_pull(
+    target: &str,
+    source_specs: &[String],
+    destination: &str,
+    verify: Option<CliTransferVerifyMode>,
+) -> AgentResult<PullSummary> {
+    let details = serde_json::json!({
+        "sources": source_specs,
+        "destination": destination,
+        "verify": verify.map(transfer_verify_name),
+    });
+    let remote_verify_roots = if matches!(verify, Some(CliTransferVerifyMode::Sha256)) {
+        Some(resolve_sha256_pull_sources(target, source_specs).await?)
+    } else {
+        None
+    };
+
+    let summary = execute_pull(target, source_specs, destination)
+        .await
+        .map_err(|err| {
+            map_operation_error(
+                "transfer.pull",
+                Some(target.to_string()),
+                &err,
+                details.clone(),
+            )
+        })?;
+
+    if let Some(mode) = verify {
+        match mode {
+            CliTransferVerifyMode::Size => verify_local_pull_against_manifest(
+                Path::new(destination),
+                destination,
+                &summary.roots,
+                &summary.entries,
+            )
+            .map_err(|err| {
+                transfer_verification_failure(
+                    target.to_string(),
+                    err.to_string(),
+                    serde_json::json!({
+                        "sources": source_specs,
+                        "destination": destination,
+                        "verification": transfer_verify_name(mode),
+                    }),
+                )
+            })?,
+            CliTransferVerifyMode::Sha256 => {
+                let remote_roots = remote_verify_roots.ok_or_else(|| {
+                    internal_agent_failure(anyhow!("missing remote verify roots"))
+                })?;
+                let destination_path = PathBuf::from(destination);
+                let local_root_paths =
+                    resolve_local_batch_roots(&destination_path, destination, &summary.roots)
+                        .map_err(internal_agent_failure)?;
+                if remote_roots.len() != local_root_paths.len() {
+                    return Err(transfer_verification_failure(
+                        target.to_string(),
+                        "pull root count did not match requested sources".to_string(),
+                        serde_json::json!({
+                            "sources": source_specs,
+                            "destination": destination,
+                            "verification": transfer_verify_name(mode),
+                        }),
+                    ));
+                }
+
+                for (remote_root, local_root) in remote_roots.iter().zip(local_root_paths.iter()) {
+                    let expected = collect_remote_transfer_state(target, remote_root, true).await?;
+                    let expected = expected.ok_or_else(|| {
+                        transfer_verification_failure(
+                            target.to_string(),
+                            format!(
+                                "remote source disappeared during verification: {}",
+                                remote_root.display()
+                            ),
+                            serde_json::json!({
+                                "source": remote_root.display().to_string(),
+                                "destination": local_root.display().to_string(),
+                                "verification": transfer_verify_name(mode),
+                            }),
+                        )
+                    })?;
+                    let actual = collect_local_transfer_state(local_root, true).map_err(|err| {
+                        transfer_verification_failure(
+                            target.to_string(),
+                            err.to_string(),
+                            serde_json::json!({
+                                "source": remote_root.display().to_string(),
+                                "destination": local_root.display().to_string(),
+                                "verification": transfer_verify_name(mode),
+                            }),
+                        )
+                    })?;
+                    if !transfer_states_match(&expected, &actual) {
+                        return Err(transfer_verification_failure(
+                            target.to_string(),
+                            format!(
+                                "local destination does not match remote source: {}",
+                                remote_root.display()
+                            ),
+                            serde_json::json!({
+                                "source": remote_root.display().to_string(),
+                                "destination": local_root.display().to_string(),
+                                "verification": transfer_verify_name(mode),
+                            }),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(PullSummary {
+        entries_received: summary.entries_received,
+        bytes_received: summary.bytes_received,
+        total_bytes: summary.total_bytes,
+        verification: verify.map(transfer_verify_name).map(ToOwned::to_owned),
+        verified: verify.is_some(),
+        roots: summary.roots,
+        entries: summary.entries,
+    })
+}
+
+async fn resolve_remote_batch_roots(
+    target: &str,
+    destination: &str,
+    roots: &[TransferRoot],
+) -> AgentResult<Vec<PathBuf>> {
+    ensure_unique_root_names(roots).map_err(internal_agent_failure)?;
+    let destination_stat = remote_fs_stat_request(target, destination, None).await?;
+    let destination_path = PathBuf::from(destination);
+
+    if roots.len() == 1 {
+        let treat_as_directory = destination_stat.exists
+            && matches!(destination_stat.kind, Some(FsEntryKind::Directory))
+            || destination.ends_with('/');
+        let root = &roots[0];
+        let base = if treat_as_directory {
+            destination_path.join(&root.source_name)
+        } else {
+            destination_path
+        };
+        return Ok(vec![base]);
+    }
+
+    if destination_stat.exists && !matches!(destination_stat.kind, Some(FsEntryKind::Directory)) {
+        return Err(invalid_request_failure(
+            format!("remote destination is not a directory: {destination}"),
+            Some(target.to_string()),
+            serde_json::json!({ "destination": destination }),
+        ));
+    }
+
+    Ok(roots
+        .iter()
+        .map(|root| destination_path.join(&root.source_name))
+        .collect())
+}
+
+async fn resolve_sha256_pull_sources(
+    target: &str,
+    source_specs: &[String],
+) -> AgentResult<Vec<PathBuf>> {
+    let mut concrete = Vec::with_capacity(source_specs.len());
+    for source in source_specs {
+        let stat = remote_fs_stat_request(target, source, None).await?;
+        if !stat.exists && has_glob_pattern(source) {
+            return Err(invalid_request_failure(
+                format!(
+                    "sha256 verification requires literal remote sources; wildcard source `{source}` is ambiguous"
+                ),
+                Some(target.to_string()),
+                serde_json::json!({ "source": source }),
+            ));
+        }
+        concrete.push(PathBuf::from(source));
+    }
+    Ok(concrete)
+}
+
+async fn remote_fs_stat_request(
+    target: &str,
+    path: &str,
+    hash: Option<HashAlgorithm>,
+) -> AgentResult<AgentFsStat> {
+    match agent_request(
+        "fs.stat",
+        target,
+        ControlRequest::FsStat {
+            path: path.to_string(),
+            hash,
+        },
+        serde_json::json!({ "path": path }),
+    )
+    .await?
+    {
+        ControlResponse::FsStat { stat } => Ok(stat),
+        other => Err(internal_agent_failure(anyhow!(
+            "unexpected response from daemon: {other:?}"
+        ))),
+    }
+}
+
+async fn remote_fs_list_request(
+    target: &str,
+    path: &str,
+    hash: Option<HashAlgorithm>,
+) -> AgentResult<Vec<AgentFsEntry>> {
+    match agent_request(
+        "fs.list",
+        target,
+        ControlRequest::FsList {
+            path: path.to_string(),
+            recursive: true,
+            max_depth: None,
+            include_hidden: true,
+            hash,
+        },
+        serde_json::json!({ "path": path }),
+    )
+    .await?
+    {
+        ControlResponse::FsList { entries } => Ok(entries),
+        other => Err(internal_agent_failure(anyhow!(
+            "unexpected response from daemon: {other:?}"
+        ))),
+    }
+}
+
+async fn remote_fs_move_request(
+    target: &str,
+    source: &str,
+    destination: &str,
+    overwrite: bool,
+) -> AgentResult<()> {
+    match agent_request(
+        "fs.move",
+        target,
+        ControlRequest::FsMove {
+            source: source.to_string(),
+            destination: destination.to_string(),
+            overwrite,
+        },
+        serde_json::json!({ "source": source, "destination": destination }),
+    )
+    .await?
+    {
+        ControlResponse::FsMoveResult { .. } => Ok(()),
+        other => Err(internal_agent_failure(anyhow!(
+            "unexpected response from daemon: {other:?}"
+        ))),
+    }
+}
+
+async fn cleanup_remote_path(target: &str, path: &str) -> AgentResult<()> {
+    match agent_request(
+        "fs.rm",
+        target,
+        ControlRequest::FsRm {
+            path: path.to_string(),
+            recursive: true,
+            force: true,
+            if_exists: true,
+        },
+        serde_json::json!({ "path": path }),
+    )
+    .await?
+    {
+        ControlResponse::FsRmResult { .. } => Ok(()),
+        other => Err(internal_agent_failure(anyhow!(
+            "unexpected response from daemon: {other:?}"
+        ))),
+    }
+}
+
+fn verify_uses_hash(mode: CliTransferVerifyMode) -> bool {
+    matches!(mode, CliTransferVerifyMode::Sha256)
+}
+
+fn staged_remote_transfer_path(final_root: &Path, index: usize) -> PathBuf {
+    let parent = final_root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = final_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("rsdb-transfer");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    parent.join(format!(".{file_name}.rsdb-transfer-{nonce}-{index}"))
+}
+
+fn collect_local_transfer_state(
+    root: &Path,
+    include_hash: bool,
+) -> Result<BTreeMap<String, TransferPathState>> {
+    let metadata = fs::symlink_metadata(root)
+        .with_context(|| format!("failed to stat local path {}", root.display()))?;
+    let mut state = BTreeMap::new();
+    collect_local_transfer_state_recursive(root, root, &metadata, include_hash, &mut state)?;
+    Ok(state)
+}
+
+fn collect_local_transfer_state_recursive(
+    root: &Path,
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    include_hash: bool,
+    state: &mut BTreeMap<String, TransferPathState>,
+) -> Result<()> {
+    let relative = relative_transfer_path(root, path)?;
+    state.insert(
+        relative,
+        TransferPathState {
+            kind: local_fs_entry_kind(metadata),
+            size: metadata.is_file().then_some(metadata.len()),
+            sha256: if include_hash && metadata.is_file() {
+                Some(sha256_local_path(path)?)
+            } else {
+                None
+            },
+        },
+    );
+
+    if metadata.is_dir() {
+        let mut children = fs::read_dir(path)
+            .with_context(|| format!("failed to read local directory {}", path.display()))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| format!("failed to read local directory {}", path.display()))?;
+        children.sort();
+        for child in children {
+            let child_metadata = fs::symlink_metadata(&child)
+                .with_context(|| format!("failed to stat local path {}", child.display()))?;
+            collect_local_transfer_state_recursive(
+                root,
+                &child,
+                &child_metadata,
+                include_hash,
+                state,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn collect_remote_transfer_state(
+    target: &str,
+    root: &Path,
+    include_hash: bool,
+) -> AgentResult<Option<BTreeMap<String, TransferPathState>>> {
+    let root_string = root.display().to_string();
+    let stat = remote_fs_stat_request(
+        target,
+        &root_string,
+        include_hash.then_some(HashAlgorithm::Sha256),
+    )
+    .await?;
+    if !stat.exists {
+        return Ok(None);
+    }
+
+    let mut state = BTreeMap::new();
+    state.insert(String::new(), transfer_state_from_stat(&stat)?);
+
+    if matches!(stat.kind, Some(FsEntryKind::Directory)) {
+        let entries = remote_fs_list_request(
+            target,
+            &root_string,
+            include_hash.then_some(HashAlgorithm::Sha256),
+        )
+        .await?;
+        for entry in entries {
+            let relative = relative_transfer_path(root, Path::new(&entry.path))
+                .map_err(internal_agent_failure)?;
+            state.insert(relative, transfer_state_from_entry(&entry));
+        }
+    }
+
+    Ok(Some(state))
+}
+
+fn transfer_states_match(
+    expected: &BTreeMap<String, TransferPathState>,
+    actual: &BTreeMap<String, TransferPathState>,
+) -> bool {
+    expected.iter().all(|(path, expected_state)| {
+        actual.get(path).is_some_and(|actual_state| {
+            expected_state.kind == actual_state.kind
+                && expected_state.size == actual_state.size
+                && match (&expected_state.sha256, &actual_state.sha256) {
+                    (Some(expected), Some(actual)) => expected == actual,
+                    (Some(_), None) => false,
+                    _ => true,
+                }
+        })
+    })
+}
+
+fn verify_local_pull_against_manifest(
+    destination: &Path,
+    destination_arg: &str,
+    roots: &[TransferRoot],
+    entries: &[TransferEntry],
+) -> Result<()> {
+    let local_root_paths = resolve_local_batch_roots(destination, destination_arg, roots)?;
+    for (index, local_root) in local_root_paths.iter().enumerate() {
+        let expected = expected_transfer_state_for_root(entries, index as u32);
+        let actual = collect_local_transfer_state(local_root, false)?;
+        if !transfer_states_match(&expected, &actual) {
+            bail!(
+                "local destination does not match pulled manifest: {}",
+                local_root.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn expected_transfer_state_for_root(
+    entries: &[TransferEntry],
+    root_index: u32,
+) -> BTreeMap<String, TransferPathState> {
+    let mut state = BTreeMap::new();
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.root_index == root_index)
+    {
+        state.insert(
+            entry.relative_path.clone(),
+            TransferPathState {
+                kind: transfer_entry_kind_to_fs_kind(&entry.kind),
+                size: matches!(entry.kind, TransferEntryKind::File).then_some(entry.size),
+                sha256: None,
+            },
+        );
+    }
+    state
+}
+
+fn transfer_entry_kind_to_fs_kind(kind: &TransferEntryKind) -> FsEntryKind {
+    match kind {
+        TransferEntryKind::File => FsEntryKind::File,
+        TransferEntryKind::Directory => FsEntryKind::Directory,
+    }
+}
+
+fn transfer_state_from_stat(stat: &AgentFsStat) -> AgentResult<TransferPathState> {
+    let kind = stat.kind.clone().ok_or_else(|| {
+        internal_agent_failure(anyhow!(
+            "fs.stat returned no kind for existing path {}",
+            stat.path
+        ))
+    })?;
+    Ok(TransferPathState {
+        size: matches!(kind, FsEntryKind::File).then_some(stat.size.unwrap_or(0)),
+        sha256: stat.sha256.clone(),
+        kind,
+    })
+}
+
+fn transfer_state_from_entry(entry: &AgentFsEntry) -> TransferPathState {
+    TransferPathState {
+        kind: entry.kind.clone(),
+        size: matches!(entry.kind, FsEntryKind::File).then_some(entry.size),
+        sha256: entry.sha256.clone(),
+    }
+}
+
+fn relative_transfer_path(root: &Path, path: &Path) -> Result<String> {
+    if root == path {
+        return Ok(String::new());
+    }
+    let relative = path.strip_prefix(root).with_context(|| {
+        format!(
+            "path {} is not under root {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+    path_to_transfer_string(relative)
+}
+
+fn local_fs_entry_kind(metadata: &std::fs::Metadata) -> FsEntryKind {
+    let file_type = metadata.file_type();
+    if file_type.is_file() {
+        FsEntryKind::File
+    } else if file_type.is_dir() {
+        FsEntryKind::Directory
+    } else if file_type.is_symlink() {
+        FsEntryKind::Symlink
+    } else {
+        FsEntryKind::Other
+    }
+}
+
+fn sha256_local_path(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to open {} for hashing", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn transfer_verification_failure(
+    target: String,
+    message: impl Into<String>,
+    details: serde_json::Value,
+) -> AgentCommandFailure {
+    AgentCommandFailure {
+        code: "transfer.verification_failed".to_string(),
+        message: message.into(),
+        target: Some(target),
+        retryable: false,
+        details,
+        exit_code: 1,
+    }
+}
+
+fn map_operation_error(
+    command: &str,
+    target: Option<String>,
+    err: &anyhow::Error,
+    details: serde_json::Value,
+) -> AgentCommandFailure {
+    if let Some(remote) = remote_control_error(err) {
+        return map_remote_error(
+            command,
+            target.unwrap_or_default(),
+            remote.code.clone(),
+            remote.message.clone(),
+            details,
+        );
+    }
+
+    if error_has_io_kind(err, std::io::ErrorKind::PermissionDenied) {
+        return AgentCommandFailure {
+            code: "fs.permission_denied".to_string(),
+            message: err.to_string(),
+            target,
+            retryable: false,
+            details,
+            exit_code: 1,
+        };
+    }
+
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| {
+                io_err.kind() == std::io::ErrorKind::StorageFull
+                    || io_err.raw_os_error() == Some(28)
+            })
+    }) {
+        return AgentCommandFailure {
+            code: "fs.no_space".to_string(),
+            message: err.to_string(),
+            target,
+            retryable: false,
+            details,
+            exit_code: 1,
+        };
+    }
+
+    let mut failure = map_transport_error(command, target, err);
+    failure.details = details;
+    failure
+}
+
+fn remote_control_error(err: &anyhow::Error) -> Option<&RemoteControlError> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<RemoteControlError>())
+}
+
+fn require_agent_target(target: Option<&str>) -> AgentResult<String> {
+    match target {
+        Some(value) => normalize_target_addr(value).map_err(internal_agent_failure),
+        None => Err(AgentCommandFailure {
+            code: "target.required".to_string(),
+            message: "agent command requires --target <addr>".to_string(),
+            target: None,
+            retryable: false,
+            details: serde_json::json!({}),
+            exit_code: 1,
+        }),
+    }
+}
+
+async fn agent_request(
+    command: &str,
+    target: &str,
+    request_value: ControlRequest,
+    details: serde_json::Value,
+) -> AgentResult<ControlResponse> {
+    let response = request(target, request_value)
+        .await
+        .map_err(|err| map_transport_error(command, Some(target.to_string()), &err))?;
+    if let ControlResponse::Error { code, message } = response {
+        return Err(map_remote_error(
+            command,
+            target.to_string(),
+            code,
+            message,
+            details,
+        ));
+    }
+    Ok(response)
+}
+
+fn cli_hash_algorithm(value: CliHashAlgorithm) -> HashAlgorithm {
+    match value {
+        CliHashAlgorithm::Sha256 => HashAlgorithm::Sha256,
+    }
+}
+
+fn cli_content_encoding(value: CliContentEncoding) -> ContentEncoding {
+    match value {
+        CliContentEncoding::Utf8 => ContentEncoding::Utf8,
+        CliContentEncoding::Base64 => ContentEncoding::Base64,
+    }
+}
+
+fn transfer_verify_name(value: CliTransferVerifyMode) -> &'static str {
+    match value {
+        CliTransferVerifyMode::Size => "size",
+        CliTransferVerifyMode::Sha256 => "sha256",
+    }
+}
+
+fn parse_mode(value: &str) -> AgentResult<u32> {
+    let trimmed = value.trim();
+    let trimmed = trimmed.strip_prefix("0o").unwrap_or(trimmed);
+    let trimmed = trimmed.strip_prefix('0').unwrap_or(trimmed);
+    u32::from_str_radix(if trimmed.is_empty() { "0" } else { trimmed }, 8).map_err(|_| {
+        invalid_request_failure(
+            format!("invalid mode `{value}`; use an octal value like 755 or 0644"),
+            None,
+            serde_json::json!({"field": "mode"}),
+        )
+    })
+}
+
+fn read_fs_write_input(input_file: Option<&str>, stdin: bool) -> AgentResult<Vec<u8>> {
+    match (input_file, stdin) {
+        (Some(_), true) => Err(invalid_request_failure(
+            "use either --input-file or --stdin, not both",
+            None,
+            serde_json::json!({}),
+        )),
+        (None, false) => Err(invalid_request_failure(
+            "fs.write requires --input-file <path> or --stdin",
+            None,
+            serde_json::json!({}),
+        )),
+        (Some(path), false) => fs::read(path).map_err(|err| AgentCommandFailure {
+            code: "fs.not_found".to_string(),
+            message: err.to_string(),
+            target: None,
+            retryable: false,
+            details: serde_json::json!({"path": path}),
+            exit_code: 1,
+        }),
+        (None, true) => {
+            let mut buffer = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut buffer)
+                .map_err(|err| internal_agent_failure(err.into()))?;
+            Ok(buffer)
+        }
+    }
+}
+
+fn encode_local_content(bytes: &[u8], encoding: &CliContentEncoding) -> AgentResult<String> {
+    match encoding {
+        CliContentEncoding::Utf8 => String::from_utf8(bytes.to_vec()).map_err(|_| {
+            invalid_request_failure(
+                "input is not valid UTF-8; use --encoding base64 instead",
+                None,
+                serde_json::json!({}),
+            )
+        }),
+        CliContentEncoding::Base64 => Ok(base64::engine::general_purpose::STANDARD.encode(bytes)),
+    }
+}
+
+fn supported_agent_operations(features: &[String], compatible: bool) -> Vec<String> {
+    if !compatible {
+        return Vec::new();
+    }
+
+    let mut operations = vec!["discover".to_string()];
+    if has_feature(features, "agent.exec.v1") || has_feature(features, "exec.direct") {
+        operations.push("exec".to_string());
+        operations.push("exec.stream".to_string());
+    }
+    if has_feature(features, "agent.fs.stat.v1") {
+        operations.push("fs.stat".to_string());
+    }
+    if has_feature(features, "agent.fs.list.v1") {
+        operations.push("fs.list".to_string());
+    }
+    if has_feature(features, "agent.fs.read.v1") {
+        operations.push("fs.read".to_string());
+    }
+    if has_feature(features, "agent.fs.write.v1") {
+        operations.push("fs.write".to_string());
+    }
+    if has_feature(features, "agent.fs.mkdir.v1") {
+        operations.push("fs.mkdir".to_string());
+    }
+    if has_feature(features, "agent.fs.rm.v1") {
+        operations.push("fs.rm".to_string());
+    }
+    if has_feature(features, "agent.fs.move.v1") {
+        operations.push("fs.move".to_string());
+    }
+    if has_feature(features, "agent.transfer.push.v1") || has_feature(features, "fs.push.batch") {
+        operations.push("transfer.push".to_string());
+    }
+    if has_feature(features, "agent.transfer.pull.v1") || has_feature(features, "fs.pull.batch") {
+        operations.push("transfer.pull".to_string());
+    }
+    operations
+}
+
+fn agent_schema() -> AgentSchemaData {
+    AgentSchemaData {
+        usage_rules: vec![
+            "call schema to learn the static command contract".to_string(),
+            "call discover when no target is known".to_string(),
+            "choose targets from discover.data.targets using compatible and supported_operations"
+                .to_string(),
+            "use exec for direct remote process execution".to_string(),
+            "use exec with --stream for long-running commands or live output".to_string(),
+            "use fs.* for small structured filesystem work".to_string(),
+            "use transfer.* for bulk files or directories".to_string(),
+            "pass --target for every target-scoped operation".to_string(),
+            "use -- before the remote command argv for exec".to_string(),
+        ],
+        operations: vec![
+            AgentSchemaOperation {
+                name: "schema".to_string(),
+                purpose: "return the static rsdb agent command contract".to_string(),
+                target_required: false,
+                options: Vec::new(),
+                positional: Vec::new(),
+            },
+            AgentSchemaOperation {
+                name: "discover".to_string(),
+                purpose: "find reachable targets and report per-target supported operations"
+                    .to_string(),
+                target_required: false,
+                options: vec![
+                    schema_option("probe-addr", "string", false, true, false),
+                    schema_option("port", "u16", false, true, false),
+                    schema_option("timeout-ms", "u64", false, true, false),
+                ],
+                positional: Vec::new(),
+            },
+            AgentSchemaOperation {
+                name: "exec".to_string(),
+                purpose: "run one direct remote process".to_string(),
+                target_required: true,
+                options: vec![
+                    schema_option("stream", "bool", false, false, false),
+                    schema_option("check", "bool", false, false, false),
+                ],
+                positional: vec![schema_positional("command", "string", true, true)],
+            },
+            AgentSchemaOperation {
+                name: "fs.stat".to_string(),
+                purpose: "read structured metadata for one remote path".to_string(),
+                target_required: true,
+                options: vec![schema_option("hash", "enum(sha256)", false, true, false)],
+                positional: vec![schema_positional("path", "string", true, false)],
+            },
+            AgentSchemaOperation {
+                name: "fs.list".to_string(),
+                purpose: "list a remote path or directory tree".to_string(),
+                target_required: true,
+                options: vec![
+                    schema_option("recursive", "bool", false, false, false),
+                    schema_option("max-depth", "u32", false, true, false),
+                    schema_option("include-hidden", "bool", false, false, false),
+                    schema_option("hash", "enum(sha256)", false, true, false),
+                ],
+                positional: vec![schema_positional("path", "string", true, false)],
+            },
+            AgentSchemaOperation {
+                name: "fs.read".to_string(),
+                purpose: "read one small remote file inline".to_string(),
+                target_required: true,
+                options: vec![
+                    schema_option("encoding", "enum(utf8|base64)", false, true, false),
+                    schema_option("max-bytes", "u64", false, true, false),
+                ],
+                positional: vec![schema_positional("path", "string", true, false)],
+            },
+            AgentSchemaOperation {
+                name: "fs.write".to_string(),
+                purpose: "write one small remote file".to_string(),
+                target_required: true,
+                options: vec![
+                    schema_option("input-file", "string", false, true, false),
+                    schema_option("stdin", "bool", false, false, false),
+                    schema_option("encoding", "enum(utf8|base64)", false, true, false),
+                    schema_option("mode", "octal-string", false, true, false),
+                    schema_option("create-parent", "bool", false, false, false),
+                    schema_option("atomic", "bool", false, false, false),
+                    schema_option("if-missing", "bool", false, false, false),
+                    schema_option("if-sha256", "string", false, true, false),
+                ],
+                positional: vec![schema_positional("path", "string", true, false)],
+            },
+            AgentSchemaOperation {
+                name: "fs.mkdir".to_string(),
+                purpose: "create a remote directory".to_string(),
+                target_required: true,
+                options: vec![
+                    schema_option("parents", "bool", false, false, false),
+                    schema_option("mode", "octal-string", false, true, false),
+                ],
+                positional: vec![schema_positional("path", "string", true, false)],
+            },
+            AgentSchemaOperation {
+                name: "fs.rm".to_string(),
+                purpose: "remove a remote file or directory".to_string(),
+                target_required: true,
+                options: vec![
+                    schema_option("recursive", "bool", false, false, false),
+                    schema_option("force", "bool", false, false, false),
+                    schema_option("if-exists", "bool", false, false, false),
+                ],
+                positional: vec![schema_positional("path", "string", true, false)],
+            },
+            AgentSchemaOperation {
+                name: "fs.move".to_string(),
+                purpose: "rename or move one remote path".to_string(),
+                target_required: true,
+                options: vec![schema_option("overwrite", "bool", false, false, false)],
+                positional: vec![
+                    schema_positional("source", "string", true, false),
+                    schema_positional("destination", "string", true, false),
+                ],
+            },
+            AgentSchemaOperation {
+                name: "transfer.push".to_string(),
+                purpose: "push bulk local files or directories".to_string(),
+                target_required: true,
+                options: vec![
+                    schema_option("verify", "enum(size|sha256)", false, true, false),
+                    schema_option("atomic", "bool", false, false, false),
+                    schema_option("if-changed", "bool", false, false, false),
+                ],
+                positional: vec![schema_positional("paths", "string", true, true)],
+            },
+            AgentSchemaOperation {
+                name: "transfer.pull".to_string(),
+                purpose: "pull bulk remote files or directories".to_string(),
+                target_required: true,
+                options: vec![schema_option(
+                    "verify",
+                    "enum(size|sha256)",
+                    false,
+                    true,
+                    false,
+                )],
+                positional: vec![schema_positional("paths", "string", true, true)],
+            },
+        ],
+        target_required_for: vec![
+            "exec".to_string(),
+            "fs.stat".to_string(),
+            "fs.list".to_string(),
+            "fs.read".to_string(),
+            "fs.write".to_string(),
+            "fs.mkdir".to_string(),
+            "fs.rm".to_string(),
+            "fs.move".to_string(),
+            "transfer.push".to_string(),
+            "transfer.pull".to_string(),
+        ],
+    }
+}
+
+fn schema_option(
+    name: &'static str,
+    kind: &'static str,
+    required: bool,
+    takes_value: bool,
+    multiple: bool,
+) -> AgentSchemaOption {
+    AgentSchemaOption {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        required,
+        takes_value,
+        multiple,
+    }
+}
+
+fn schema_positional(
+    name: &'static str,
+    kind: &'static str,
+    required: bool,
+    multiple: bool,
+) -> AgentSchemaPositional {
+    AgentSchemaPositional {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        required,
+        multiple,
+    }
+}
+
+fn has_feature(features: &[String], expected: &str) -> bool {
+    features.iter().any(|feature| feature == expected)
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn emit_agent_success<T>(command: &str, data: T) -> Result<()>
+where
+    T: Serialize,
+{
+    write_json_stdout(&AgentEnvelope {
+        schema_version: "agent.v1",
+        command: command.to_string(),
+        ok: true,
+        data: Some(data),
+        error: None,
+    })
+}
+
+fn emit_agent_failure(command: &str, error: AgentCommandFailure) -> Result<i32> {
+    write_json_stdout(&AgentEnvelope::<serde_json::Value> {
+        schema_version: "agent.v1",
+        command: command.to_string(),
+        ok: false,
+        data: None,
+        error: Some(AgentErrorBody {
+            code: error.code,
+            message: error.message,
+            target: error.target,
+            retryable: error.retryable,
+            details: error.details,
+        }),
+    })?;
+    Ok(error.exit_code)
+}
+
+fn emit_agent_event<T>(command: &'static str, event: &'static str, data: Option<T>) -> Result<()>
+where
+    T: Serialize,
+{
+    write_json_stdout(&AgentEventEnvelope {
+        schema_version: "agent.v1",
+        command,
+        event,
+        data,
+        error: None,
+    })
+}
+
+fn emit_agent_event_failure<T>(
+    command: &'static str,
+    event: &'static str,
+    error: AgentCommandFailure,
+    data: Option<T>,
+) -> Result<()>
+where
+    T: Serialize,
+{
+    write_json_stdout(&AgentEventEnvelope {
+        schema_version: "agent.v1",
+        command,
+        event,
+        data,
+        error: Some(AgentErrorBody {
+            code: error.code,
+            message: error.message,
+            target: error.target,
+            retryable: error.retryable,
+            details: error.details,
+        }),
+    })
+}
+
+fn write_json_stdout<T>(value: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    let stdout = std::io::stdout();
+    let mut locked = stdout.lock();
+    serde_json::to_writer(&mut locked, value)?;
+    locked.write_all(b"\n")?;
+    locked.flush()?;
+    Ok(())
+}
+
+fn invalid_request_failure(
+    message: impl Into<String>,
+    target: Option<String>,
+    details: serde_json::Value,
+) -> AgentCommandFailure {
+    AgentCommandFailure {
+        code: "invalid.request".to_string(),
+        message: message.into(),
+        target,
+        retryable: false,
+        details,
+        exit_code: 1,
+    }
+}
+
+fn map_transport_error(
+    command: &str,
+    target: Option<String>,
+    err: &anyhow::Error,
+) -> AgentCommandFailure {
+    let (code, retryable) = if let Some(remote) = remote_control_error(err) {
+        return map_remote_error(
+            command,
+            target.unwrap_or_default(),
+            remote.code.clone(),
+            remote.message.clone(),
+            serde_json::json!({}),
+        );
+    } else if error_has_elapsed(err) {
+        ("connection.timeout", true)
+    } else if error_has_io_kind(err, std::io::ErrorKind::ConnectionRefused) {
+        ("connection.refused", true)
+    } else if error_has_protocol_mismatch(err) {
+        ("connection.protocol_mismatch", false)
+    } else if command.starts_with("transfer")
+        && error_has_io_kind(err, std::io::ErrorKind::NotFound)
+    {
+        ("fs.not_found", false)
+    } else if error_has_io_kind(err, std::io::ErrorKind::PermissionDenied) {
+        ("fs.permission_denied", false)
+    } else {
+        ("internal.error", false)
+    };
+
+    AgentCommandFailure {
+        code: code.to_string(),
+        message: err.to_string(),
+        target,
+        retryable,
+        details: serde_json::json!({}),
+        exit_code: 1,
+    }
+}
+
+fn map_remote_error(
+    command: &str,
+    target: String,
+    code: rsdb_proto::ErrorCode,
+    message: String,
+    details: serde_json::Value,
+) -> AgentCommandFailure {
+    let (mapped_code, retryable) = match code {
+        rsdb_proto::ErrorCode::InvalidRequest => ("invalid.request", false),
+        rsdb_proto::ErrorCode::CapabilityMissing => ("capability.missing", false),
+        rsdb_proto::ErrorCode::ExecFailed if message.contains("timed out") => {
+            ("exec.timeout", true)
+        }
+        rsdb_proto::ErrorCode::ExecFailed | rsdb_proto::ErrorCode::ExecStartFailed => {
+            ("exec.start_failed", false)
+        }
+        rsdb_proto::ErrorCode::ExecTimeout => ("exec.timeout", true),
+        rsdb_proto::ErrorCode::NotFound | rsdb_proto::ErrorCode::FsNotFound => {
+            ("fs.not_found", false)
+        }
+        rsdb_proto::ErrorCode::FsPermissionDenied => ("fs.permission_denied", false),
+        rsdb_proto::ErrorCode::FsPreconditionFailed => ("fs.precondition_failed", false),
+        rsdb_proto::ErrorCode::FsNoSpace => ("fs.no_space", false),
+        rsdb_proto::ErrorCode::TransferInterrupted => ("transfer.interrupted", true),
+        rsdb_proto::ErrorCode::TransferVerificationFailed => {
+            ("transfer.verification_failed", false)
+        }
+        rsdb_proto::ErrorCode::FileTransferFailed if command.starts_with("transfer") => {
+            ("transfer.failed", false)
+        }
+        rsdb_proto::ErrorCode::Internal | rsdb_proto::ErrorCode::FileTransferFailed => {
+            ("daemon.error", false)
+        }
+    };
+
+    AgentCommandFailure {
+        code: mapped_code.to_string(),
+        message,
+        target: Some(target),
+        retryable,
+        details,
+        exit_code: 1,
+    }
+}
+
+fn map_remote_exec_error(
+    target: String,
+    code: rsdb_proto::ErrorCode,
+    message: String,
+    details: serde_json::Value,
+) -> AgentCommandFailure {
+    map_remote_error("exec", target, code, message, details)
+}
+
+fn exec_nonzero_failure(target: String, data: &AgentExecData) -> AgentCommandFailure {
+    AgentCommandFailure {
+        code: "exec.nonzero".to_string(),
+        message: format!("remote command exited with status {}", data.status),
+        target: Some(target),
+        retryable: false,
+        details: serde_json::json!({
+            "status": data.status,
+            "stdout": data.stdout,
+            "stderr": data.stderr,
+            "duration_ms": data.duration_ms,
+            "timed_out": data.timed_out,
+        }),
+        exit_code: data.status,
+    }
+}
+
+fn exec_nonzero_failure_from_completion(
+    target: String,
+    data: &AgentExecCompletionData,
+) -> AgentCommandFailure {
+    AgentCommandFailure {
+        code: "exec.nonzero".to_string(),
+        message: format!("remote command exited with status {}", data.status),
+        target: Some(target),
+        retryable: false,
+        details: serde_json::json!({
+            "status": data.status,
+            "duration_ms": data.duration_ms,
+            "timed_out": data.timed_out,
+        }),
+        exit_code: data.status,
+    }
+}
+
+fn internal_agent_failure(err: anyhow::Error) -> AgentCommandFailure {
+    AgentCommandFailure {
+        code: "internal.error".to_string(),
+        message: err.to_string(),
+        target: None,
+        retryable: false,
+        details: serde_json::json!({}),
+        exit_code: 1,
+    }
+}
+
+fn error_has_io_kind(err: &anyhow::Error, expected: std::io::ErrorKind) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| io_err.kind() == expected)
+    })
+}
+
+fn error_has_elapsed(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+    })
+}
+
+fn error_has_protocol_mismatch(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<rsdb_proto::ProtocolError>()
+            .is_some_and(|protocol_err| {
+                matches!(
+                    protocol_err,
+                    rsdb_proto::ProtocolError::UnsupportedVersion(_)
+                )
+            })
+    })
 }
 
 fn discovery_nonce() -> u64 {
@@ -626,9 +3205,43 @@ async fn push_command(
     remote_path: &str,
 ) -> Result<()> {
     let addr = resolve_target(target)?;
+    let summary = execute_push(&addr, source_specs, remote_path).await?;
+    println!(
+        "pushed {}\t{}\t{} entries\t{} bytes",
+        describe_sources(source_specs),
+        remote_path,
+        summary.entries_written,
+        summary.bytes_written
+    );
+    Ok(())
+}
+
+async fn pull_command(
+    target: Option<&str>,
+    remote_sources: &[String],
+    local_destination: &str,
+) -> Result<()> {
+    let addr = resolve_target(target)?;
+    let summary = execute_pull(&addr, remote_sources, local_destination).await?;
+    let local_path = PathBuf::from(local_destination);
+    println!(
+        "pulled {}\t{}\t{} entries\t{} / {} bytes",
+        describe_sources(remote_sources),
+        local_path.display(),
+        summary.entries_received,
+        summary.bytes_received,
+        summary.total_bytes
+    );
+    Ok(())
+}
+
+async fn execute_push(
+    addr: &str,
+    source_specs: &[String],
+    remote_path: &str,
+) -> Result<PushSummary> {
     let manifest = build_local_batch_manifest(source_specs)?;
     let mut stream = open_connection(&addr).await?;
-
     write_json_frame(
         &mut stream,
         FrameKind::Request,
@@ -645,7 +3258,7 @@ async fn push_command(
     match read_response(&mut stream).await? {
         ControlResponse::PushBatchReady => {}
         ControlResponse::Error { code, message } => {
-            bail!("remote error {code:?}: {message}");
+            return Err(RemoteControlError { code, message }.into());
         }
         other => bail!("unexpected response from daemon: {other:?}"),
     }
@@ -669,28 +3282,26 @@ async fn push_command(
             if bytes_written != bytes_sent {
                 bail!("push size mismatch: daemon wrote {bytes_written} bytes, sent {bytes_sent}");
             }
-            println!(
-                "pushed {}\t{}\t{} entries\t{} bytes",
-                describe_sources(source_specs),
-                remote_path,
+            Ok(PushSummary {
                 entries_written,
-                bytes_written
-            );
-            Ok(())
+                bytes_written,
+                skipped: false,
+                verification: None,
+                verified: false,
+            })
         }
         ControlResponse::Error { code, message } => {
-            bail!("remote error {code:?}: {message}");
+            Err(RemoteControlError { code, message }.into())
         }
         other => bail!("unexpected response from daemon: {other:?}"),
     }
 }
 
-async fn pull_command(
-    target: Option<&str>,
+async fn execute_pull(
+    addr: &str,
     remote_sources: &[String],
     local_destination: &str,
-) -> Result<()> {
-    let addr = resolve_target(target)?;
+) -> Result<PullSummary> {
     let mut stream = open_connection(&addr).await?;
     write_json_frame(
         &mut stream,
@@ -710,7 +3321,7 @@ async fn pull_command(
             total_bytes,
         } => (roots, entries, total_bytes),
         ControlResponse::Error { code, message } => {
-            bail!("remote error {code:?}: {message}");
+            return Err(RemoteControlError { code, message }.into());
         }
         other => bail!("unexpected response from daemon: {other:?}"),
     };
@@ -740,18 +3351,18 @@ async fn pull_command(
                     "pull size mismatch: daemon sent {bytes_sent} bytes, received {bytes_received}"
                 );
             }
-            println!(
-                "pulled {}\t{}\t{} entries\t{} / {} bytes",
-                describe_sources(remote_sources),
-                local_path.display(),
+            Ok(PullSummary {
                 entries_received,
                 bytes_received,
-                total_bytes
-            );
-            Ok(())
+                total_bytes,
+                verification: None,
+                verified: false,
+                roots,
+                entries,
+            })
         }
         ControlResponse::Error { code, message } => {
-            bail!("remote error {code:?}: {message}");
+            Err(RemoteControlError { code, message }.into())
         }
         other => bail!("unexpected response from daemon: {other:?}"),
     }
@@ -932,7 +3543,8 @@ fn append_local_manifest_entry(
 }
 
 async fn stream_local_batch_files(stream: &mut TcpStream, files: &[LocalBatchFile]) -> Result<u64> {
-    let mut writer = tokio::io::BufWriter::with_capacity(HEADER_LEN + DEFAULT_STREAM_CHUNK_SIZE, &mut *stream);
+    let mut writer =
+        tokio::io::BufWriter::with_capacity(HEADER_LEN + DEFAULT_STREAM_CHUNK_SIZE, &mut *stream);
     let mut buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
     let mut total_bytes = 0_u64;
 
@@ -1711,4 +4323,137 @@ fn normalize_mode(mode: u32) -> u32 {
 #[cfg(not(unix))]
 fn normalize_mode(_mode: u32) -> u32 {
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supported_agent_operations_require_compatibility() {
+        let operations = supported_agent_operations(
+            &[
+                "agent.exec.v1".to_string(),
+                "agent.fs.read.v1".to_string(),
+                "agent.transfer.push.v1".to_string(),
+                "agent.transfer.pull.v1".to_string(),
+            ],
+            false,
+        );
+
+        assert!(operations.is_empty());
+    }
+
+    #[test]
+    fn supported_agent_operations_follow_feature_advertisement() {
+        let operations = supported_agent_operations(
+            &[
+                "agent.exec.v1".to_string(),
+                "agent.fs.stat.v1".to_string(),
+                "agent.fs.read.v1".to_string(),
+                "agent.transfer.push.v1".to_string(),
+            ],
+            true,
+        );
+
+        assert_eq!(
+            operations,
+            vec![
+                "discover".to_string(),
+                "exec".to_string(),
+                "exec.stream".to_string(),
+                "fs.stat".to_string(),
+                "fs.read".to_string(),
+                "transfer.push".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn require_agent_target_rejects_missing_target() {
+        let err = require_agent_target(None).expect_err("missing target should fail");
+        assert_eq!(err.code, "target.required");
+    }
+
+    #[test]
+    fn agent_schema_lists_core_operations() {
+        let schema = agent_schema();
+        let names = schema
+            .operations
+            .iter()
+            .map(|operation| operation.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"schema"));
+        assert!(names.contains(&"discover"));
+        assert!(names.contains(&"exec"));
+        assert!(names.contains(&"fs.read"));
+        assert!(names.contains(&"transfer.push"));
+        assert!(names.contains(&"transfer.pull"));
+    }
+
+    #[test]
+    fn agent_schema_marks_target_scoped_operations() {
+        let schema = agent_schema();
+
+        assert!(schema.target_required_for.contains(&"exec".to_string()));
+        assert!(schema.target_required_for.contains(&"fs.write".to_string()));
+        assert!(
+            schema
+                .target_required_for
+                .contains(&"transfer.pull".to_string())
+        );
+        assert!(!schema.target_required_for.contains(&"schema".to_string()));
+        assert!(!schema.target_required_for.contains(&"discover".to_string()));
+    }
+
+    #[test]
+    fn transfer_state_matching_ignores_unmanaged_extra_entries() {
+        let expected = BTreeMap::from([
+            (
+                String::new(),
+                TransferPathState {
+                    kind: FsEntryKind::Directory,
+                    size: None,
+                    sha256: None,
+                },
+            ),
+            (
+                "app.txt".to_string(),
+                TransferPathState {
+                    kind: FsEntryKind::File,
+                    size: Some(4),
+                    sha256: Some("deadbeef".to_string()),
+                },
+            ),
+        ]);
+        let actual = BTreeMap::from([
+            (
+                String::new(),
+                TransferPathState {
+                    kind: FsEntryKind::Directory,
+                    size: None,
+                    sha256: None,
+                },
+            ),
+            (
+                "app.txt".to_string(),
+                TransferPathState {
+                    kind: FsEntryKind::File,
+                    size: Some(4),
+                    sha256: Some("deadbeef".to_string()),
+                },
+            ),
+            (
+                "logs/debug.txt".to_string(),
+                TransferPathState {
+                    kind: FsEntryKind::File,
+                    size: Some(8),
+                    sha256: Some("cafebabe".to_string()),
+                },
+            ),
+        ]);
+
+        assert!(transfer_states_match(&expected, &actual));
+    }
 }

@@ -151,9 +151,18 @@ pub struct DiscoveryResponse {
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     InvalidRequest,
+    CapabilityMissing,
     ExecFailed,
+    ExecStartFailed,
+    ExecTimeout,
     FileTransferFailed,
     NotFound,
+    FsNotFound,
+    FsPermissionDenied,
+    FsPreconditionFailed,
+    FsNoSpace,
+    TransferInterrupted,
+    TransferVerificationFailed,
     Internal,
 }
 
@@ -181,6 +190,92 @@ pub struct TransferEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FsEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HashAlgorithm {
+    Sha256,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentEncoding {
+    #[default]
+    Utf8,
+    Base64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentFsStat {
+    pub path: String,
+    pub exists: bool,
+    pub kind: Option<FsEntryKind>,
+    pub size: Option<u64>,
+    pub mode: Option<u32>,
+    pub mtime_unix_ms: Option<u64>,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentFsEntry {
+    pub path: String,
+    pub kind: FsEntryKind,
+    pub size: u64,
+    pub mode: u32,
+    pub mtime_unix_ms: Option<u64>,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentFsReadResult {
+    pub path: String,
+    pub encoding: ContentEncoding,
+    pub content: String,
+    pub bytes: u64,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentFsWriteResult {
+    pub path: String,
+    pub bytes_written: u64,
+    pub mode: Option<u32>,
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentFsMkdirResult {
+    pub path: String,
+    #[serde(default)]
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentFsRmResult {
+    pub path: String,
+    #[serde(default)]
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentFsMoveResult {
+    pub source: String,
+    pub destination: String,
+    #[serde(default)]
+    pub overwritten: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlRequest {
     Ping,
@@ -188,6 +283,69 @@ pub enum ControlRequest {
     Exec {
         command: String,
         args: Vec<String>,
+        #[serde(default)]
+        stream: bool,
+    },
+    FsStat {
+        path: String,
+        #[serde(default)]
+        hash: Option<HashAlgorithm>,
+    },
+    FsList {
+        path: String,
+        #[serde(default)]
+        recursive: bool,
+        #[serde(default)]
+        max_depth: Option<u32>,
+        #[serde(default)]
+        include_hidden: bool,
+        #[serde(default)]
+        hash: Option<HashAlgorithm>,
+    },
+    FsRead {
+        path: String,
+        #[serde(default)]
+        encoding: ContentEncoding,
+        #[serde(default)]
+        max_bytes: Option<u64>,
+    },
+    FsWrite {
+        path: String,
+        content: String,
+        #[serde(default)]
+        encoding: ContentEncoding,
+        #[serde(default)]
+        mode: Option<u32>,
+        #[serde(default)]
+        create_parent: bool,
+        #[serde(default)]
+        atomic: bool,
+        #[serde(default)]
+        if_missing: bool,
+        #[serde(default)]
+        if_sha256: Option<String>,
+    },
+    FsMkdir {
+        path: String,
+        #[serde(default)]
+        parents: bool,
+        #[serde(default)]
+        mode: Option<u32>,
+    },
+    FsRm {
+        path: String,
+        #[serde(default)]
+        recursive: bool,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        if_exists: bool,
+    },
+    FsMove {
+        source: String,
+        destination: String,
+        #[serde(default)]
+        overwrite: bool,
     },
     Push {
         path: String,
@@ -235,6 +393,29 @@ pub enum ControlResponse {
         status: i32,
         stdout: String,
         stderr: String,
+        #[serde(default)]
+        timed_out: bool,
+    },
+    FsStat {
+        stat: AgentFsStat,
+    },
+    FsList {
+        entries: Vec<AgentFsEntry>,
+    },
+    FsReadResult {
+        result: AgentFsReadResult,
+    },
+    FsWriteResult {
+        result: AgentFsWriteResult,
+    },
+    FsMkdirResult {
+        result: AgentFsMkdirResult,
+    },
+    FsRmResult {
+        result: AgentFsRmResult,
+    },
+    FsMoveResult {
+        result: AgentFsMoveResult,
     },
     PushReady,
     PushComplete {
@@ -475,6 +656,7 @@ mod tests {
         let request = ControlRequest::Exec {
             command: "echo".to_string(),
             args: vec!["hello".to_string()],
+            stream: false,
         };
 
         let expected = request.clone();
@@ -510,6 +692,70 @@ mod tests {
         assert_eq!(decoded.channel, StreamChannel::File);
         assert!(decoded.eof);
         assert_eq!(decoded.payload, b"chunk-data");
+    }
+
+    #[tokio::test]
+    async fn fs_request_round_trip() {
+        let (mut client, mut server) = duplex(1024);
+        let request = ControlRequest::FsWrite {
+            path: "/tmp/example.txt".to_string(),
+            content: "aGVsbG8=".to_string(),
+            encoding: ContentEncoding::Base64,
+            mode: Some(0o600),
+            create_parent: true,
+            atomic: true,
+            if_missing: false,
+            if_sha256: Some("deadbeef".to_string()),
+        };
+
+        let expected = request.clone();
+        let send = tokio::spawn(async move {
+            write_json_frame(&mut client, FrameKind::Request, 10, &request)
+                .await
+                .expect("frame should write");
+        });
+
+        let frame = read_frame(&mut server).await.expect("frame should read");
+        send.await.expect("writer task should finish");
+        let decoded: ControlRequest =
+            decode_json(&frame, FrameKind::Request).expect("request should decode");
+        assert_eq!(decoded, expected);
+    }
+
+    #[tokio::test]
+    async fn fs_response_round_trip() {
+        let (mut client, mut server) = duplex(1024);
+        let response = ControlResponse::FsStat {
+            stat: AgentFsStat {
+                path: "/tmp/example.txt".to_string(),
+                exists: true,
+                kind: Some(FsEntryKind::File),
+                size: Some(5),
+                mode: Some(0o644),
+                mtime_unix_ms: Some(42),
+                sha256: Some("abc".to_string()),
+            },
+        };
+
+        let expected = response.clone();
+        let send = tokio::spawn(async move {
+            write_json_frame(&mut client, FrameKind::Response, 11, &response)
+                .await
+                .expect("frame should write");
+        });
+
+        let frame = read_frame(&mut server).await.expect("frame should read");
+        send.await.expect("writer task should finish");
+        let decoded: ControlResponse =
+            decode_json(&frame, FrameKind::Response).expect("response should decode");
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn error_code_serialization_is_stable() {
+        let encoded = serde_json::to_string(&ErrorCode::FsPreconditionFailed)
+            .expect("error code should encode");
+        assert_eq!(encoded, "\"fs_precondition_failed\"");
     }
 
     #[test]

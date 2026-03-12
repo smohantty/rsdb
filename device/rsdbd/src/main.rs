@@ -1,6 +1,7 @@
+use base64::Engine as _;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs::File as StdFile, fs::OpenOptions as StdOpenOptions, io};
 
 use std::path::{Component, Path, PathBuf};
@@ -14,8 +15,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use glob::{MatchOptions, glob_with};
 use rsdb_proto::{
-    CapabilitySet, ControlRequest, ControlResponse, DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest, HEADER_LEN,
-    DiscoveryResponse, ErrorCode, FrameKind, MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION,
+    AgentFsEntry, AgentFsMkdirResult, AgentFsMoveResult, AgentFsReadResult, AgentFsRmResult,
+    AgentFsStat, AgentFsWriteResult, CapabilitySet, ContentEncoding, ControlRequest,
+    ControlResponse, DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest, DiscoveryResponse, ErrorCode,
+    FrameKind, FsEntryKind, HEADER_LEN, HashAlgorithm, MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION,
     ProtocolError, StreamChannel, TransferEntry, TransferEntryKind, TransferRoot,
     decode_discovery_message, decode_json, decode_stream_frame, encode_discovery_message,
     read_frame, write_json_frame, write_stream_frame,
@@ -23,6 +26,7 @@ use rsdb_proto::{
 use rustix_openpty::rustix::fd::IntoRawFd as _;
 use rustix_openpty::rustix::termios::Winsize;
 use rustix_openpty::{login_tty, openpty};
+use sha2::{Digest, Sha256};
 use tokio::fs::{File, OpenOptions, metadata};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -31,6 +35,7 @@ use tokio::time::timeout;
 use tracing::{debug, trace, warn};
 
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_AGENT_FS_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "rsdbd")]
@@ -83,6 +88,28 @@ struct BatchManifest {
     files: Vec<BatchFileSource>,
     total_bytes: u64,
 }
+
+#[derive(Debug)]
+struct FsPreconditionError(String);
+
+impl std::fmt::Display for FsPreconditionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FsPreconditionError {}
+
+#[derive(Debug)]
+struct FsInvalidRequestError(String);
+
+impl std::fmt::Display for FsInvalidRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FsInvalidRequestError {}
 
 impl io::Write for SharedLogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -313,15 +340,116 @@ async fn handle_request(
             };
             write_json_frame(&mut stream, FrameKind::Response, request_id, &response).await?;
         }
-        ControlRequest::Exec { command, args } => {
-            let response = match execute_command(&command, &args, state).await {
-                Ok(result) => result,
-                Err(err) => ControlResponse::Error {
-                    code: ErrorCode::ExecFailed,
-                    message: err.to_string(),
-                },
-            };
-            write_json_frame(&mut stream, FrameKind::Response, request_id, &response).await?;
+        ControlRequest::Exec {
+            command,
+            args,
+            stream: stream_output,
+        } => {
+            return handle_exec_request(stream, request_id, &command, &args, stream_output, state)
+                .await;
+        }
+        ControlRequest::FsStat { path, hash } => {
+            if let Err(err) = handle_fs_stat(&mut stream, request_id, &path, hash).await {
+                let code = classify_fs_error(&err);
+                send_error(&mut stream, request_id, code, err).await?;
+            }
+        }
+        ControlRequest::FsList {
+            path,
+            recursive,
+            max_depth,
+            include_hidden,
+            hash,
+        } => {
+            if let Err(err) = handle_fs_list(
+                &mut stream,
+                request_id,
+                &path,
+                recursive,
+                max_depth,
+                include_hidden,
+                hash,
+            )
+            .await
+            {
+                let code = classify_fs_error(&err);
+                send_error(&mut stream, request_id, code, err).await?;
+            }
+        }
+        ControlRequest::FsRead {
+            path,
+            encoding,
+            max_bytes,
+        } => {
+            if let Err(err) =
+                handle_fs_read(&mut stream, request_id, &path, encoding, max_bytes).await
+            {
+                let code = classify_fs_error(&err);
+                send_error(&mut stream, request_id, code, err).await?;
+            }
+        }
+        ControlRequest::FsWrite {
+            path,
+            content,
+            encoding,
+            mode,
+            create_parent,
+            atomic,
+            if_missing,
+            if_sha256,
+        } => {
+            if let Err(err) = handle_fs_write(
+                &mut stream,
+                request_id,
+                &path,
+                &content,
+                encoding,
+                mode,
+                create_parent,
+                atomic,
+                if_missing,
+                if_sha256.as_deref(),
+            )
+            .await
+            {
+                let code = classify_fs_error(&err);
+                send_error(&mut stream, request_id, code, err).await?;
+            }
+        }
+        ControlRequest::FsMkdir {
+            path,
+            parents,
+            mode,
+        } => {
+            if let Err(err) = handle_fs_mkdir(&mut stream, request_id, &path, parents, mode).await {
+                let code = classify_fs_error(&err);
+                send_error(&mut stream, request_id, code, err).await?;
+            }
+        }
+        ControlRequest::FsRm {
+            path,
+            recursive,
+            force,
+            if_exists,
+        } => {
+            if let Err(err) =
+                handle_fs_rm(&mut stream, request_id, &path, recursive, force, if_exists).await
+            {
+                let code = classify_fs_error(&err);
+                send_error(&mut stream, request_id, code, err).await?;
+            }
+        }
+        ControlRequest::FsMove {
+            source,
+            destination,
+            overwrite,
+        } => {
+            if let Err(err) =
+                handle_fs_move(&mut stream, request_id, &source, &destination, overwrite).await
+            {
+                let code = classify_fs_error(&err);
+                send_error(&mut stream, request_id, code, err).await?;
+            }
         }
         ControlRequest::Push {
             path,
@@ -384,6 +512,18 @@ fn capabilities() -> CapabilitySet {
             "discover.udp".to_string(),
             "ping".to_string(),
             "capability".to_string(),
+            "exec.direct".to_string(),
+            "exec.stream".to_string(),
+            "agent.exec.v1".to_string(),
+            "agent.fs.stat.v1".to_string(),
+            "agent.fs.list.v1".to_string(),
+            "agent.fs.read.v1".to_string(),
+            "agent.fs.write.v1".to_string(),
+            "agent.fs.mkdir.v1".to_string(),
+            "agent.fs.rm.v1".to_string(),
+            "agent.fs.move.v1".to_string(),
+            "agent.transfer.push.v1".to_string(),
+            "agent.transfer.pull.v1".to_string(),
             "shell.exec".to_string(),
             "shell.interactive".to_string(),
             "shell.pty".to_string(),
@@ -393,6 +533,39 @@ fn capabilities() -> CapabilitySet {
             "fs.pull.batch".to_string(),
         ],
     }
+}
+
+async fn handle_exec_request(
+    mut stream: TcpStream,
+    request_id: u32,
+    command: &str,
+    args: &[String],
+    stream_output: bool,
+    state: &ServerState,
+) -> Result<()> {
+    if stream_output {
+        return match stream_command_output(&mut stream, request_id, command, args).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let response = ControlResponse::Error {
+                    code: ErrorCode::ExecFailed,
+                    message: err.to_string(),
+                };
+                write_json_frame(&mut stream, FrameKind::Response, request_id, &response).await?;
+                Ok(())
+            }
+        };
+    }
+
+    let response = match execute_command(command, args, state).await {
+        Ok(result) => result,
+        Err(err) => ControlResponse::Error {
+            code: ErrorCode::ExecFailed,
+            message: err.to_string(),
+        },
+    };
+    write_json_frame(&mut stream, FrameKind::Response, request_id, &response).await?;
+    Ok(())
 }
 
 async fn execute_command(
@@ -422,7 +595,754 @@ async fn execute_command(
         status,
         stdout,
         stderr,
+        timed_out: false,
     })
+}
+
+async fn stream_command_output(
+    stream: &mut TcpStream,
+    request_id: u32,
+    command: &str,
+    args: &[String],
+) -> Result<()> {
+    if command.trim().is_empty() {
+        bail!("command must not be empty");
+    }
+
+    let mut child = Command::new(command);
+    child.args(args);
+    child.stdout(Stdio::piped());
+    child.stderr(Stdio::piped());
+
+    let mut child = child
+        .spawn()
+        .with_context(|| format!("failed to execute command: {command}"))?;
+    let mut child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("child stdout was not captured"))?;
+    let mut child_stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("child stderr was not captured"))?;
+
+    let mut writer = tokio::io::BufWriter::new(&mut *stream);
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut exit_status = None;
+    let mut wait = Box::pin(child.wait());
+    let mut stdout_buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
+    let mut stderr_buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
+
+    while stdout_open || stderr_open || exit_status.is_none() {
+        tokio::select! {
+            read = child_stdout.read(&mut stdout_buffer), if stdout_open => {
+                let read = read?;
+                if read == 0 {
+                    stdout_open = false;
+                    write_stream_frame(&mut writer, request_id, StreamChannel::Stdout, true, &[]).await?;
+                } else {
+                    write_stream_frame(
+                        &mut writer,
+                        request_id,
+                        StreamChannel::Stdout,
+                        false,
+                        &stdout_buffer[..read],
+                    ).await?;
+                }
+            }
+            read = child_stderr.read(&mut stderr_buffer), if stderr_open => {
+                let read = read?;
+                if read == 0 {
+                    stderr_open = false;
+                    write_stream_frame(&mut writer, request_id, StreamChannel::Stderr, true, &[]).await?;
+                } else {
+                    write_stream_frame(
+                        &mut writer,
+                        request_id,
+                        StreamChannel::Stderr,
+                        false,
+                        &stderr_buffer[..read],
+                    ).await?;
+                }
+            }
+            status = &mut wait, if exit_status.is_none() => {
+                exit_status = Some(status.context("failed to wait for exec process")?);
+            }
+        }
+    }
+
+    let status = match exit_status {
+        Some(status) => status,
+        None => wait.await.context("failed to wait for exec process")?,
+    };
+    write_json_frame(
+        &mut writer,
+        FrameKind::Response,
+        request_id,
+        &ControlResponse::ExecResult {
+            status: status.code().unwrap_or(-1),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn handle_fs_stat(
+    stream: &mut TcpStream,
+    request_id: u32,
+    path: &str,
+    hash: Option<HashAlgorithm>,
+) -> Result<()> {
+    let requested = validate_fs_path(path)?;
+    let stat = match std::fs::symlink_metadata(&requested) {
+        Ok(metadata) => build_fs_stat(&requested, &metadata, hash.as_ref())?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => AgentFsStat {
+            path: requested.display().to_string(),
+            exists: false,
+            kind: None,
+            size: None,
+            mode: None,
+            mtime_unix_ms: None,
+            sha256: None,
+        },
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", requested.display()));
+        }
+    };
+
+    write_json_frame(
+        stream,
+        FrameKind::Response,
+        request_id,
+        &ControlResponse::FsStat { stat },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn handle_fs_list(
+    stream: &mut TcpStream,
+    request_id: u32,
+    path: &str,
+    recursive: bool,
+    max_depth: Option<u32>,
+    include_hidden: bool,
+    hash: Option<HashAlgorithm>,
+) -> Result<()> {
+    let requested = validate_fs_path(path)?;
+    let metadata = std::fs::symlink_metadata(&requested)
+        .with_context(|| format!("failed to stat {}", requested.display()))?;
+    let mut entries = Vec::new();
+
+    if metadata.is_dir() {
+        collect_fs_entries(
+            &requested,
+            recursive,
+            max_depth,
+            include_hidden,
+            hash.as_ref(),
+            0,
+            &mut entries,
+        )?;
+    } else {
+        entries.push(build_fs_entry(&requested, &metadata, hash.as_ref())?);
+    }
+
+    write_json_frame(
+        stream,
+        FrameKind::Response,
+        request_id,
+        &ControlResponse::FsList { entries },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn handle_fs_read(
+    stream: &mut TcpStream,
+    request_id: u32,
+    path: &str,
+    encoding: ContentEncoding,
+    max_bytes: Option<u64>,
+) -> Result<()> {
+    let requested = validate_fs_path(path)?;
+    let metadata = std::fs::symlink_metadata(&requested)
+        .with_context(|| format!("failed to stat {}", requested.display()))?;
+    if !metadata.is_file() {
+        return Err(FsInvalidRequestError(format!(
+            "path is not a regular file: {}",
+            requested.display()
+        ))
+        .into());
+    }
+
+    let read_limit = max_bytes
+        .unwrap_or(MAX_AGENT_FS_BYTES)
+        .min(MAX_AGENT_FS_BYTES);
+    let file = File::open(&requested)
+        .await
+        .with_context(|| format!("failed to open {}", requested.display()))?;
+    let mut bytes = Vec::new();
+    let mut take = file.take(read_limit.saturating_add(1));
+    take.read_to_end(&mut bytes).await?;
+    let truncated = bytes.len() as u64 > read_limit;
+    if truncated {
+        bytes.truncate(read_limit as usize);
+    }
+
+    let content = encode_fs_content(&bytes, &encoding)?;
+    write_json_frame(
+        stream,
+        FrameKind::Response,
+        request_id,
+        &ControlResponse::FsReadResult {
+            result: AgentFsReadResult {
+                path: requested.display().to_string(),
+                encoding,
+                content,
+                bytes: bytes.len() as u64,
+                truncated,
+            },
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_fs_write(
+    stream: &mut TcpStream,
+    request_id: u32,
+    path: &str,
+    content: &str,
+    encoding: ContentEncoding,
+    mode: Option<u32>,
+    create_parent: bool,
+    atomic: bool,
+    if_missing: bool,
+    if_sha256: Option<&str>,
+) -> Result<()> {
+    let requested = validate_fs_path(path)?;
+    let bytes = decode_fs_content(content, &encoding)?;
+    if bytes.len() as u64 > MAX_AGENT_FS_BYTES {
+        return Err(FsInvalidRequestError(format!(
+            "write exceeds maximum payload of {MAX_AGENT_FS_BYTES} bytes"
+        ))
+        .into());
+    }
+
+    if let Some(parent) = requested.parent() {
+        if !parent.as_os_str().is_empty() && create_parent {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+    }
+
+    let existing_metadata = match std::fs::symlink_metadata(&requested) {
+        Ok(metadata) => Some(metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", requested.display()));
+        }
+    };
+    if existing_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.is_dir())
+    {
+        return Err(
+            FsInvalidRequestError(format!("path is a directory: {}", requested.display())).into(),
+        );
+    }
+    if if_missing && existing_metadata.is_some() {
+        return Err(fs_precondition_failed(format!(
+            "path already exists: {}",
+            requested.display()
+        )));
+    }
+    if let Some(expected) = if_sha256 {
+        let metadata = existing_metadata.as_ref().ok_or_else(|| {
+            fs_precondition_failed(format!("path does not exist: {}", requested.display()))
+        })?;
+        if !metadata.is_file() {
+            return Err(fs_precondition_failed(format!(
+                "path is not a regular file: {}",
+                requested.display()
+            )));
+        }
+        let actual = sha256_path(&requested)?;
+        if actual != expected {
+            return Err(fs_precondition_failed(format!(
+                "sha256 precondition failed for {}",
+                requested.display()
+            )));
+        }
+    }
+
+    let previous_sha256 = existing_metadata
+        .as_ref()
+        .filter(|metadata| metadata.is_file())
+        .map(|_| sha256_path(&requested))
+        .transpose()?;
+    let desired_sha256 = sha256_bytes(&bytes);
+
+    if atomic {
+        write_atomic_file(&requested, &bytes, mode).await?;
+    } else {
+        write_direct_file(&requested, &bytes, mode).await?;
+    }
+
+    let final_mode = std::fs::symlink_metadata(&requested)
+        .ok()
+        .map(|metadata| file_mode(&metadata));
+    write_json_frame(
+        stream,
+        FrameKind::Response,
+        request_id,
+        &ControlResponse::FsWriteResult {
+            result: AgentFsWriteResult {
+                path: requested.display().to_string(),
+                bytes_written: bytes.len() as u64,
+                mode: final_mode,
+                sha256: Some(desired_sha256.clone()),
+                changed: previous_sha256.as_deref() != Some(desired_sha256.as_str()),
+            },
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn handle_fs_mkdir(
+    stream: &mut TcpStream,
+    request_id: u32,
+    path: &str,
+    parents: bool,
+    mode: Option<u32>,
+) -> Result<()> {
+    let requested = validate_fs_path(path)?;
+    let created = match std::fs::symlink_metadata(&requested) {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                return Err(fs_precondition_failed(format!(
+                    "path exists and is not a directory: {}",
+                    requested.display()
+                )));
+            }
+            false
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if parents {
+                tokio::fs::create_dir_all(&requested)
+                    .await
+                    .with_context(|| format!("failed to create {}", requested.display()))?;
+            } else {
+                tokio::fs::create_dir(&requested)
+                    .await
+                    .with_context(|| format!("failed to create {}", requested.display()))?;
+            }
+            true
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", requested.display()));
+        }
+    };
+
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        tokio::fs::set_permissions(
+            &requested,
+            std::fs::Permissions::from_mode(normalize_mode(mode)),
+        )
+        .await
+        .with_context(|| format!("failed to set permissions on {}", requested.display()))?;
+    }
+
+    write_json_frame(
+        stream,
+        FrameKind::Response,
+        request_id,
+        &ControlResponse::FsMkdirResult {
+            result: AgentFsMkdirResult {
+                path: requested.display().to_string(),
+                created,
+            },
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn handle_fs_rm(
+    stream: &mut TcpStream,
+    request_id: u32,
+    path: &str,
+    recursive: bool,
+    force: bool,
+    if_exists: bool,
+) -> Result<()> {
+    let requested = validate_fs_path(path)?;
+    let metadata = match std::fs::symlink_metadata(&requested) {
+        Ok(metadata) => Some(metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && (force || if_exists) => None,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(err).with_context(|| format!("failed to stat {}", requested.display()));
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", requested.display()));
+        }
+    };
+
+    let removed = if let Some(metadata) = metadata {
+        if metadata.is_dir() {
+            if recursive {
+                tokio::fs::remove_dir_all(&requested)
+                    .await
+                    .with_context(|| format!("failed to remove {}", requested.display()))?;
+            } else {
+                tokio::fs::remove_dir(&requested)
+                    .await
+                    .with_context(|| format!("failed to remove {}", requested.display()))?;
+            }
+        } else {
+            tokio::fs::remove_file(&requested)
+                .await
+                .with_context(|| format!("failed to remove {}", requested.display()))?;
+        }
+        true
+    } else {
+        false
+    };
+
+    write_json_frame(
+        stream,
+        FrameKind::Response,
+        request_id,
+        &ControlResponse::FsRmResult {
+            result: AgentFsRmResult {
+                path: requested.display().to_string(),
+                removed,
+            },
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn handle_fs_move(
+    stream: &mut TcpStream,
+    request_id: u32,
+    source: &str,
+    destination: &str,
+    overwrite: bool,
+) -> Result<()> {
+    let source_path = validate_fs_path(source)?;
+    let destination_path = validate_fs_path(destination)?;
+    std::fs::symlink_metadata(&source_path)
+        .with_context(|| format!("failed to stat {}", source_path.display()))?;
+
+    let destination_metadata = match std::fs::symlink_metadata(&destination_path) {
+        Ok(metadata) => Some(metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to stat {}", destination_path.display()));
+        }
+    };
+
+    if destination_metadata.is_some() && !overwrite {
+        return Err(fs_precondition_failed(format!(
+            "destination already exists: {}",
+            destination_path.display()
+        )));
+    }
+
+    let overwritten = destination_metadata.is_some();
+    if let Some(metadata) = destination_metadata {
+        if metadata.is_dir() {
+            tokio::fs::remove_dir_all(&destination_path)
+                .await
+                .with_context(|| format!("failed to remove {}", destination_path.display()))?;
+        } else {
+            tokio::fs::remove_file(&destination_path)
+                .await
+                .with_context(|| format!("failed to remove {}", destination_path.display()))?;
+        }
+    }
+
+    tokio::fs::rename(&source_path, &destination_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to move {} to {}",
+                source_path.display(),
+                destination_path.display()
+            )
+        })?;
+
+    write_json_frame(
+        stream,
+        FrameKind::Response,
+        request_id,
+        &ControlResponse::FsMoveResult {
+            result: AgentFsMoveResult {
+                source: source_path.display().to_string(),
+                destination: destination_path.display().to_string(),
+                overwritten,
+            },
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+fn validate_fs_path(path: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(path);
+    if path.as_os_str().is_empty() {
+        return Err(FsInvalidRequestError("path must not be empty".to_string()).into());
+    }
+    Ok(path)
+}
+
+fn build_fs_stat(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    hash: Option<&HashAlgorithm>,
+) -> Result<AgentFsStat> {
+    Ok(AgentFsStat {
+        path: path.display().to_string(),
+        exists: true,
+        kind: Some(fs_entry_kind(metadata)),
+        size: Some(metadata.len()),
+        mode: Some(file_mode(metadata)),
+        mtime_unix_ms: metadata_mtime_unix_ms(metadata),
+        sha256: match hash {
+            Some(HashAlgorithm::Sha256) if metadata.is_file() => Some(sha256_path(path)?),
+            _ => None,
+        },
+    })
+}
+
+fn collect_fs_entries(
+    path: &Path,
+    recursive: bool,
+    max_depth: Option<u32>,
+    include_hidden: bool,
+    hash: Option<&HashAlgorithm>,
+    depth: u32,
+    entries: &mut Vec<AgentFsEntry>,
+) -> Result<()> {
+    let mut children = std::fs::read_dir(path)
+        .with_context(|| format!("failed to read directory {}", path.display()))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("failed to read directory {}", path.display()))?;
+    children.sort();
+
+    for child in children {
+        let hidden = child
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.'));
+        if hidden && !include_hidden {
+            continue;
+        }
+
+        let metadata = std::fs::symlink_metadata(&child)
+            .with_context(|| format!("failed to stat {}", child.display()))?;
+        entries.push(build_fs_entry(&child, &metadata, hash)?);
+
+        let child_depth = depth + 1;
+        let can_descend =
+            recursive && metadata.is_dir() && max_depth.is_none_or(|limit| child_depth < limit);
+        if can_descend {
+            collect_fs_entries(
+                &child,
+                recursive,
+                max_depth,
+                include_hidden,
+                hash,
+                child_depth,
+                entries,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_fs_entry(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    hash: Option<&HashAlgorithm>,
+) -> Result<AgentFsEntry> {
+    Ok(AgentFsEntry {
+        path: path.display().to_string(),
+        kind: fs_entry_kind(metadata),
+        size: metadata.len(),
+        mode: file_mode(metadata),
+        mtime_unix_ms: metadata_mtime_unix_ms(metadata),
+        sha256: match hash {
+            Some(HashAlgorithm::Sha256) if metadata.is_file() => Some(sha256_path(path)?),
+            _ => None,
+        },
+    })
+}
+
+fn fs_entry_kind(metadata: &std::fs::Metadata) -> FsEntryKind {
+    let file_type = metadata.file_type();
+    if file_type.is_file() {
+        FsEntryKind::File
+    } else if file_type.is_dir() {
+        FsEntryKind::Directory
+    } else if file_type.is_symlink() {
+        FsEntryKind::Symlink
+    } else {
+        FsEntryKind::Other
+    }
+}
+
+fn metadata_mtime_unix_ms(metadata: &std::fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+fn encode_fs_content(bytes: &[u8], encoding: &ContentEncoding) -> Result<String> {
+    match encoding {
+        ContentEncoding::Utf8 => String::from_utf8(bytes.to_vec())
+            .map_err(|_| FsInvalidRequestError("file is not valid UTF-8".to_string()).into()),
+        ContentEncoding::Base64 => Ok(base64::engine::general_purpose::STANDARD.encode(bytes)),
+    }
+}
+
+fn decode_fs_content(content: &str, encoding: &ContentEncoding) -> Result<Vec<u8>> {
+    match encoding {
+        ContentEncoding::Utf8 => Ok(content.as_bytes().to_vec()),
+        ContentEncoding::Base64 => base64::engine::general_purpose::STANDARD
+            .decode(content)
+            .map_err(|err| FsInvalidRequestError(format!("invalid base64 content: {err}")).into()),
+    }
+}
+
+async fn write_direct_file(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        options.mode(normalize_mode(mode));
+    }
+
+    let mut file = options
+        .open(path)
+        .await
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.write_all(bytes).await?;
+    file.flush().await?;
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(normalize_mode(mode)))
+            .await
+            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+    }
+    Ok(())
+}
+
+async fn write_atomic_file(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
+    let temp_path = atomic_temp_path(path);
+    let result = async {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).truncate(true);
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            options.mode(normalize_mode(mode));
+        }
+        let mut file = options
+            .open(&temp_path)
+            .await
+            .with_context(|| format!("failed to open {}", temp_path.display()))?;
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            tokio::fs::set_permissions(
+                &temp_path,
+                std::fs::Permissions::from_mode(normalize_mode(mode)),
+            )
+            .await
+            .with_context(|| format!("failed to set permissions on {}", temp_path.display()))?;
+        }
+        tokio::fs::rename(&temp_path, path).await.with_context(|| {
+            format!(
+                "failed to rename {} to {}",
+                temp_path.display(),
+                path.display()
+            )
+        })?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+    }
+    result
+}
+
+fn atomic_temp_path(path: &Path) -> PathBuf {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("rsdb-temp");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    parent.join(format!(".{file_name}.rsdb-tmp-{nonce}"))
+}
+
+fn sha256_path(path: &Path) -> Result<String> {
+    let mut file = StdFile::open(path)
+        .with_context(|| format!("failed to open {} for hashing", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_digest(&hasher.finalize()))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_digest(&hasher.finalize())
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn fs_precondition_failed(message: impl Into<String>) -> anyhow::Error {
+    FsPreconditionError(message.into()).into()
 }
 
 async fn handle_push(
@@ -530,7 +1450,8 @@ async fn handle_pull(stream: &mut TcpStream, request_id: u32, path: &str) -> Res
         .with_context(|| format!("failed to open remote path for read: {path}"))?;
     let mode = file_mode(&file_meta);
 
-    let mut writer = tokio::io::BufWriter::with_capacity(HEADER_LEN + DEFAULT_STREAM_CHUNK_SIZE, &mut *stream);
+    let mut writer =
+        tokio::io::BufWriter::with_capacity(HEADER_LEN + DEFAULT_STREAM_CHUNK_SIZE, &mut *stream);
     write_json_frame(
         &mut writer,
         FrameKind::Response,
@@ -891,7 +1812,8 @@ async fn stream_batch_files(
     request_id: u32,
     files: &[BatchFileSource],
 ) -> Result<u64> {
-    let mut writer = tokio::io::BufWriter::with_capacity(HEADER_LEN + DEFAULT_STREAM_CHUNK_SIZE, &mut *stream);
+    let mut writer =
+        tokio::io::BufWriter::with_capacity(HEADER_LEN + DEFAULT_STREAM_CHUNK_SIZE, &mut *stream);
     let mut buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
     let mut total_bytes = 0_u64;
 
@@ -1571,12 +2493,49 @@ fn classify_pull_error(err: &anyhow::Error) -> ErrorCode {
     }
 }
 
+fn classify_fs_error(err: &anyhow::Error) -> ErrorCode {
+    if is_invalid_request_error(err) {
+        ErrorCode::InvalidRequest
+    } else if is_precondition_error(err) {
+        ErrorCode::FsPreconditionFailed
+    } else if has_io_error_kind(err, std::io::ErrorKind::NotFound) {
+        ErrorCode::FsNotFound
+    } else if has_io_error_kind(err, std::io::ErrorKind::PermissionDenied) {
+        ErrorCode::FsPermissionDenied
+    } else if has_storage_full_error(err) {
+        ErrorCode::FsNoSpace
+    } else {
+        ErrorCode::Internal
+    }
+}
+
 fn has_io_error_kind(err: &anyhow::Error, expected: std::io::ErrorKind) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io_err| io_err.kind() == expected)
     })
+}
+
+fn has_storage_full_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| {
+                io_err.kind() == std::io::ErrorKind::StorageFull
+                    || io_err.raw_os_error() == Some(28)
+            })
+    })
+}
+
+fn is_precondition_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<FsPreconditionError>().is_some())
+}
+
+fn is_invalid_request_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<FsInvalidRequestError>().is_some())
 }
 
 fn join_shell_command(command: &str, args: &[String]) -> String {
