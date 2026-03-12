@@ -360,34 +360,42 @@ struct AgentDiscoverTarget {
 
 #[derive(Debug, Serialize)]
 struct AgentSchemaData {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     usage_rules: Vec<String>,
     operations: Vec<AgentSchemaOperation>,
-    target_required_for: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct AgentSchemaOperation {
     name: String,
     purpose: String,
+    #[serde(default, skip_serializing_if = "is_false")]
     target_required: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     options: Vec<AgentSchemaOption>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     positional: Vec<AgentSchemaPositional>,
 }
 
 #[derive(Debug, Serialize)]
 struct AgentSchemaOption {
     name: String,
+    #[serde(rename = "type")]
     kind: String,
+    #[serde(default, skip_serializing_if = "is_false")]
     required: bool,
-    takes_value: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     multiple: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct AgentSchemaPositional {
     name: String,
+    #[serde(rename = "type")]
     kind: String,
+    #[serde(default, skip_serializing_if = "is_false")]
     required: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     multiple: bool,
 }
 
@@ -2693,10 +2701,7 @@ fn supported_agent_operations(features: &[String], compatible: bool) -> Vec<Stri
 fn agent_schema() -> AgentSchemaData {
     AgentSchemaData {
         usage_rules: vec![
-            "call schema to learn the static command contract".to_string(),
             "call discover when no target is known".to_string(),
-            "choose targets from discover.data.targets using compatible and supported_operations"
-                .to_string(),
             "use exec for direct remote process execution".to_string(),
             "use exec with --stream for long-running commands or live output".to_string(),
             "use fs.* for small structured filesystem work".to_string(),
@@ -2718,9 +2723,9 @@ fn agent_schema() -> AgentSchemaData {
                     .to_string(),
                 target_required: false,
                 options: vec![
-                    schema_option("probe-addr", "string", false, true, false),
-                    schema_option("port", "u16", false, true, false),
-                    schema_option("timeout-ms", "u64", false, true, false),
+                    schema_option("probe-addr", "string", false, false),
+                    schema_option("port", "u16", false, false),
+                    schema_option("timeout-ms", "u64", false, false),
                 ],
                 positional: Vec::new(),
             },
@@ -2729,8 +2734,8 @@ fn agent_schema() -> AgentSchemaData {
                 purpose: "run one direct remote process".to_string(),
                 target_required: true,
                 options: vec![
-                    schema_option("stream", "bool", false, false, false),
-                    schema_option("check", "bool", false, false, false),
+                    schema_option("stream", "bool", false, false),
+                    schema_option("check", "bool", false, false),
                 ],
                 positional: vec![schema_positional("command", "string", true, true)],
             },
@@ -2738,7 +2743,7 @@ fn agent_schema() -> AgentSchemaData {
                 name: "fs.stat".to_string(),
                 purpose: "read structured metadata for one remote path".to_string(),
                 target_required: true,
-                options: vec![schema_option("hash", "enum(sha256)", false, true, false)],
+                options: vec![schema_option("hash", "enum(sha256)", false, false)],
                 positional: vec![schema_positional("path", "string", true, false)],
             },
             AgentSchemaOperation {
@@ -2746,10 +2751,10 @@ fn agent_schema() -> AgentSchemaData {
                 purpose: "list a remote path or directory tree".to_string(),
                 target_required: true,
                 options: vec![
-                    schema_option("recursive", "bool", false, false, false),
-                    schema_option("max-depth", "u32", false, true, false),
-                    schema_option("include-hidden", "bool", false, false, false),
-                    schema_option("hash", "enum(sha256)", false, true, false),
+                    schema_option("recursive", "bool", false, false),
+                    schema_option("max-depth", "u32", false, false),
+                    schema_option("include-hidden", "bool", false, false),
+                    schema_option("hash", "enum(sha256)", false, false),
                 ],
                 positional: vec![schema_positional("path", "string", true, false)],
             },
@@ -2758,8 +2763,8 @@ fn agent_schema() -> AgentSchemaData {
                 purpose: "read one small remote file inline".to_string(),
                 target_required: true,
                 options: vec![
-                    schema_option("encoding", "enum(utf8|base64)", false, true, false),
-                    schema_option("max-bytes", "u64", false, true, false),
+                    schema_option("encoding", "enum(utf8|base64)", false, false),
+                    schema_option("max-bytes", "u64", false, false),
                 ],
                 positional: vec![schema_positional("path", "string", true, false)],
             },
@@ -2768,14 +2773,14 @@ fn agent_schema() -> AgentSchemaData {
                 purpose: "write one small remote file".to_string(),
                 target_required: true,
                 options: vec![
-                    schema_option("input-file", "string", false, true, false),
-                    schema_option("stdin", "bool", false, false, false),
-                    schema_option("encoding", "enum(utf8|base64)", false, true, false),
-                    schema_option("mode", "octal-string", false, true, false),
-                    schema_option("create-parent", "bool", false, false, false),
-                    schema_option("atomic", "bool", false, false, false),
-                    schema_option("if-missing", "bool", false, false, false),
-                    schema_option("if-sha256", "string", false, true, false),
+                    schema_option("input-file", "string", false, false),
+                    schema_option("stdin", "bool", false, false),
+                    schema_option("encoding", "enum(utf8|base64)", false, false),
+                    schema_option("mode", "octal-string", false, false),
+                    schema_option("create-parent", "bool", false, false),
+                    schema_option("atomic", "bool", false, false),
+                    schema_option("if-missing", "bool", false, false),
+                    schema_option("if-sha256", "string", false, false),
                 ],
                 positional: vec![schema_positional("path", "string", true, false)],
             },
@@ -2784,8 +2789,8 @@ fn agent_schema() -> AgentSchemaData {
                 purpose: "create a remote directory".to_string(),
                 target_required: true,
                 options: vec![
-                    schema_option("parents", "bool", false, false, false),
-                    schema_option("mode", "octal-string", false, true, false),
+                    schema_option("parents", "bool", false, false),
+                    schema_option("mode", "octal-string", false, false),
                 ],
                 positional: vec![schema_positional("path", "string", true, false)],
             },
@@ -2794,9 +2799,9 @@ fn agent_schema() -> AgentSchemaData {
                 purpose: "remove a remote file or directory".to_string(),
                 target_required: true,
                 options: vec![
-                    schema_option("recursive", "bool", false, false, false),
-                    schema_option("force", "bool", false, false, false),
-                    schema_option("if-exists", "bool", false, false, false),
+                    schema_option("recursive", "bool", false, false),
+                    schema_option("force", "bool", false, false),
+                    schema_option("if-exists", "bool", false, false),
                 ],
                 positional: vec![schema_positional("path", "string", true, false)],
             },
@@ -2804,7 +2809,7 @@ fn agent_schema() -> AgentSchemaData {
                 name: "fs.move".to_string(),
                 purpose: "rename or move one remote path".to_string(),
                 target_required: true,
-                options: vec![schema_option("overwrite", "bool", false, false, false)],
+                options: vec![schema_option("overwrite", "bool", false, false)],
                 positional: vec![
                     schema_positional("source", "string", true, false),
                     schema_positional("destination", "string", true, false),
@@ -2815,9 +2820,9 @@ fn agent_schema() -> AgentSchemaData {
                 purpose: "push bulk local files or directories".to_string(),
                 target_required: true,
                 options: vec![
-                    schema_option("verify", "enum(size|sha256)", false, true, false),
-                    schema_option("atomic", "bool", false, false, false),
-                    schema_option("if-changed", "bool", false, false, false),
+                    schema_option("verify", "enum(size|sha256)", false, false),
+                    schema_option("atomic", "bool", false, false),
+                    schema_option("if-changed", "bool", false, false),
                 ],
                 positional: vec![schema_positional("paths", "string", true, true)],
             },
@@ -2825,27 +2830,9 @@ fn agent_schema() -> AgentSchemaData {
                 name: "transfer.pull".to_string(),
                 purpose: "pull bulk remote files or directories".to_string(),
                 target_required: true,
-                options: vec![schema_option(
-                    "verify",
-                    "enum(size|sha256)",
-                    false,
-                    true,
-                    false,
-                )],
+                options: vec![schema_option("verify", "enum(size|sha256)", false, false)],
                 positional: vec![schema_positional("paths", "string", true, true)],
             },
-        ],
-        target_required_for: vec![
-            "exec".to_string(),
-            "fs.stat".to_string(),
-            "fs.list".to_string(),
-            "fs.read".to_string(),
-            "fs.write".to_string(),
-            "fs.mkdir".to_string(),
-            "fs.rm".to_string(),
-            "fs.move".to_string(),
-            "transfer.push".to_string(),
-            "transfer.pull".to_string(),
         ],
     }
 }
@@ -2854,14 +2841,12 @@ fn schema_option(
     name: &'static str,
     kind: &'static str,
     required: bool,
-    takes_value: bool,
     multiple: bool,
 ) -> AgentSchemaOption {
     AgentSchemaOption {
         name: name.to_string(),
         kind: kind.to_string(),
         required,
-        takes_value,
         multiple,
     }
 }
@@ -2878,6 +2863,10 @@ fn schema_positional(
         required,
         multiple,
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn has_feature(features: &[String], expected: &str) -> bool {
@@ -4395,16 +4384,17 @@ mod tests {
     #[test]
     fn agent_schema_marks_target_scoped_operations() {
         let schema = agent_schema();
+        let by_name = schema
+            .operations
+            .iter()
+            .map(|operation| (operation.name.as_str(), operation.target_required))
+            .collect::<BTreeMap<_, _>>();
 
-        assert!(schema.target_required_for.contains(&"exec".to_string()));
-        assert!(schema.target_required_for.contains(&"fs.write".to_string()));
-        assert!(
-            schema
-                .target_required_for
-                .contains(&"transfer.pull".to_string())
-        );
-        assert!(!schema.target_required_for.contains(&"schema".to_string()));
-        assert!(!schema.target_required_for.contains(&"discover".to_string()));
+        assert_eq!(by_name.get("exec"), Some(&true));
+        assert_eq!(by_name.get("fs.write"), Some(&true));
+        assert_eq!(by_name.get("transfer.pull"), Some(&true));
+        assert_eq!(by_name.get("schema"), Some(&false));
+        assert_eq!(by_name.get("discover"), Some(&false));
     }
 
     #[test]
