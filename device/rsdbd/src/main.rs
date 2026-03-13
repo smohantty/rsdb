@@ -873,7 +873,8 @@ async fn handle_fs_read(
         bytes.truncate(read_limit as usize);
     }
 
-    let content = encode_fs_content(&bytes, &encoding)?;
+    let bytes_len = bytes.len() as u64;
+    let content = encode_fs_content(bytes, &encoding)?;
     write_json_frame(
         stream,
         FrameKind::Response,
@@ -883,7 +884,7 @@ async fn handle_fs_read(
                 path: requested.display().to_string(),
                 encoding,
                 content,
-                bytes: bytes.len() as u64,
+                bytes: bytes_len,
                 truncated,
             },
         },
@@ -943,6 +944,12 @@ async fn handle_fs_write(
             requested.display()
         )));
     }
+    let desired_sha256 = sha256_bytes(&bytes);
+    let existing_file_metadata = existing_metadata
+        .as_ref()
+        .filter(|metadata| metadata.is_file());
+    let mut previous_sha256 = None;
+
     if let Some(expected) = if_sha256 {
         let metadata = existing_metadata.as_ref().ok_or_else(|| {
             fs_precondition_failed(format!("path does not exist: {}", requested.display()))
@@ -960,14 +967,19 @@ async fn handle_fs_write(
                 requested.display()
             )));
         }
+        previous_sha256 = Some(actual);
     }
 
-    let previous_sha256 = existing_metadata
-        .as_ref()
-        .filter(|metadata| metadata.is_file())
-        .map(|_| sha256_path(&requested))
-        .transpose()?;
-    let desired_sha256 = sha256_bytes(&bytes);
+    let changed = match existing_file_metadata {
+        None => true,
+        Some(metadata) if metadata.len() != bytes.len() as u64 => true,
+        Some(_) => {
+            if previous_sha256.is_none() {
+                previous_sha256 = Some(sha256_path(&requested)?);
+            }
+            previous_sha256.as_deref() != Some(desired_sha256.as_str())
+        }
+    };
 
     if atomic {
         write_atomic_file(&requested, &bytes, mode).await?;
@@ -988,7 +1000,7 @@ async fn handle_fs_write(
                 bytes_written: bytes.len() as u64,
                 mode: final_mode,
                 sha256: Some(desired_sha256.clone()),
-                changed: previous_sha256.as_deref() != Some(desired_sha256.as_str()),
+                changed,
             },
         },
     )
@@ -1293,9 +1305,9 @@ fn metadata_mtime_unix_ms(metadata: &std::fs::Metadata) -> Option<u64> {
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
 }
 
-fn encode_fs_content(bytes: &[u8], encoding: &ContentEncoding) -> Result<String> {
+fn encode_fs_content(bytes: Vec<u8>, encoding: &ContentEncoding) -> Result<String> {
     match encoding {
-        ContentEncoding::Utf8 => String::from_utf8(bytes.to_vec())
+        ContentEncoding::Utf8 => String::from_utf8(bytes)
             .map_err(|_| FsInvalidRequestError("file is not valid UTF-8".to_string()).into()),
         ContentEncoding::Base64 => Ok(base64::engine::general_purpose::STANDARD.encode(bytes)),
     }

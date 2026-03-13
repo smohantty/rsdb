@@ -1649,7 +1649,7 @@ async fn agent_fs_write_command(
         Ok(bytes) => bytes,
         Err(err) => return emit_agent_failure("fs.write", err),
     };
-    let content = match encode_local_content(&bytes, &encoding) {
+    let content = match encode_local_content(bytes, &encoding) {
         Ok(content) => content,
         Err(err) => return emit_agent_failure("fs.write", err),
     };
@@ -2685,9 +2685,9 @@ fn read_fs_write_input(input_file: Option<&str>, stdin: bool) -> AgentResult<Vec
     }
 }
 
-fn encode_local_content(bytes: &[u8], encoding: &CliContentEncoding) -> AgentResult<String> {
+fn encode_local_content(bytes: Vec<u8>, encoding: &CliContentEncoding) -> AgentResult<String> {
     match encoding {
-        CliContentEncoding::Utf8 => String::from_utf8(bytes.to_vec()).map_err(|_| {
+        CliContentEncoding::Utf8 => String::from_utf8(bytes).map_err(|_| {
             invalid_request_failure(
                 "input is not valid UTF-8; use --encoding base64 instead",
                 None,
