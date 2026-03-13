@@ -4359,6 +4359,66 @@ mod tests {
     }
 
     #[test]
+    fn supported_agent_operations_cover_full_modern_surface() {
+        let operations = supported_agent_operations(
+            &[
+                "agent.exec.v1".to_string(),
+                "agent.fs.stat.v1".to_string(),
+                "agent.fs.list.v1".to_string(),
+                "agent.fs.read.v1".to_string(),
+                "agent.fs.write.v1".to_string(),
+                "agent.fs.mkdir.v1".to_string(),
+                "agent.fs.rm.v1".to_string(),
+                "agent.fs.move.v1".to_string(),
+                "agent.transfer.push.v1".to_string(),
+                "agent.transfer.pull.v1".to_string(),
+            ],
+            true,
+        );
+
+        assert_eq!(
+            operations,
+            vec![
+                "discover".to_string(),
+                "exec".to_string(),
+                "exec.stream".to_string(),
+                "fs.stat".to_string(),
+                "fs.list".to_string(),
+                "fs.read".to_string(),
+                "fs.write".to_string(),
+                "fs.mkdir".to_string(),
+                "fs.rm".to_string(),
+                "fs.move".to_string(),
+                "transfer.push".to_string(),
+                "transfer.pull".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn supported_agent_operations_accept_legacy_transfer_fallbacks() {
+        let operations = supported_agent_operations(
+            &[
+                "exec.direct".to_string(),
+                "fs.push.batch".to_string(),
+                "fs.pull.batch".to_string(),
+            ],
+            true,
+        );
+
+        assert_eq!(
+            operations,
+            vec![
+                "discover".to_string(),
+                "exec".to_string(),
+                "exec.stream".to_string(),
+                "transfer.push".to_string(),
+                "transfer.pull".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn require_agent_target_rejects_missing_target() {
         let err = require_agent_target(None).expect_err("missing target should fail");
         assert_eq!(err.code, "target.required");
@@ -4376,7 +4436,12 @@ mod tests {
         assert!(names.contains(&"schema"));
         assert!(names.contains(&"discover"));
         assert!(names.contains(&"exec"));
+        assert!(names.contains(&"fs.list"));
         assert!(names.contains(&"fs.read"));
+        assert!(names.contains(&"fs.write"));
+        assert!(names.contains(&"fs.mkdir"));
+        assert!(names.contains(&"fs.rm"));
+        assert!(names.contains(&"fs.move"));
         assert!(names.contains(&"transfer.push"));
         assert!(names.contains(&"transfer.pull"));
     }
@@ -4395,6 +4460,40 @@ mod tests {
         assert_eq!(by_name.get("transfer.pull"), Some(&true));
         assert_eq!(by_name.get("schema"), Some(&false));
         assert_eq!(by_name.get("discover"), Some(&false));
+    }
+
+    #[test]
+    fn agent_schema_exec_declares_stream_and_check_options() {
+        let schema = agent_schema();
+        let exec = schema
+            .operations
+            .iter()
+            .find(|operation| operation.name == "exec")
+            .expect("exec operation should exist");
+
+        let option_names = exec
+            .options
+            .iter()
+            .map(|option| option.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(option_names, vec!["stream", "check"]);
+        assert!(exec.target_required);
+        assert_eq!(exec.positional.len(), 1);
+        assert_eq!(exec.positional[0].name, "command");
+        assert!(exec.positional[0].multiple);
+    }
+
+    #[test]
+    fn agent_schema_lists_all_fs_operations_as_target_scoped() {
+        let schema = agent_schema();
+        let fs_operations = schema
+            .operations
+            .iter()
+            .filter(|operation| operation.name.starts_with("fs."))
+            .collect::<Vec<_>>();
+
+        assert_eq!(fs_operations.len(), 7);
+        assert!(fs_operations.iter().all(|operation| operation.target_required));
     }
 
     #[test]
