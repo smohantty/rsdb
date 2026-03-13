@@ -18,12 +18,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
 use glob::{MatchOptions, glob_with};
 use rsdb_proto::{
-    AgentFsEntry, AgentFsStat, CapabilitySet, ContentEncoding, ControlRequest, ControlResponse,
-    DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest, DiscoveryResponse, FrameKind, FsEntryKind,
-    HEADER_LEN, HashAlgorithm, MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION, StreamChannel,
-    TransferEntry, TransferEntryKind, TransferRoot, decode_discovery_message, decode_json,
-    decode_stream_frame, encode_discovery_message, read_frame, read_stream_frame_into,
-    write_json_frame, write_stream_frame,
+    AgentFsEntry, AgentFsReadResult, AgentFsStat, AgentFsWriteResult, CapabilitySet,
+    ContentEncoding, ControlRequest, ControlResponse, DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest,
+    DiscoveryResponse, FrameKind, FsEntryKind, HEADER_LEN, HashAlgorithm,
+    MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION, StreamChannel, TransferEntry, TransferEntryKind,
+    TransferRoot, decode_discovery_message, decode_json, decode_stream_frame,
+    encode_discovery_message, read_frame, read_stream_frame_into, write_json_frame,
+    write_stream_frame,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,6 +37,7 @@ use tracing::{debug, trace};
 
 const REQUEST_ID: u32 = 1;
 const DEFAULT_RSDB_PORT: u16 = 27101;
+const DEFAULT_INLINE_EDIT_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 struct RawModeGuard(bool);
 
@@ -115,6 +117,16 @@ enum Commands {
         target: Option<String>,
         #[arg(value_name = "PATH", required = true, num_args = 2..)]
         paths: Vec<String>,
+    },
+    /// Edit one remote file in a local host editor.
+    Edit {
+        #[arg(long, value_name = "ADDR")]
+        target: Option<String>,
+        /// Editor command. Falls back to RSDB_EDITOR, VISUAL, EDITOR, then `vi`.
+        #[arg(long, value_name = "CMD")]
+        editor: Option<String>,
+        #[arg(value_name = "REMOTE_PATH")]
+        path: String,
     },
     /// Machine-facing agent command surface.
     Agent {
@@ -552,6 +564,14 @@ async fn main() -> Result<()> {
         Commands::Pull { target, paths } => {
             let (sources, destination) = split_sources_and_destination(&paths, "pull")?;
             pull_command(target.as_deref(), &sources, &destination).await?;
+            0
+        }
+        Commands::Edit {
+            target,
+            editor,
+            path,
+        } => {
+            edit_command(target.as_deref(), editor.as_deref(), &path).await?;
             0
         }
         Commands::Agent { target, command } => agent_command(target.as_deref(), command).await?,
@@ -3268,6 +3288,107 @@ async fn pull_command(
     Ok(())
 }
 
+async fn edit_command(target: Option<&str>, editor: Option<&str>, remote_path: &str) -> Result<()> {
+    let addr = resolve_target(target)?;
+    let stat = remote_fs_stat(&addr, remote_path, Some(HashAlgorithm::Sha256)).await?;
+    if !stat.exists {
+        bail!("remote path does not exist: {remote_path}");
+    }
+    if !matches!(stat.kind, Some(FsEntryKind::File)) {
+        bail!("remote path is not a regular file: {remote_path}");
+    }
+
+    let remote_mode = stat.mode.unwrap_or(0);
+    let original_remote_sha256 = stat
+        .sha256
+        .clone()
+        .ok_or_else(|| anyhow!("remote stat did not include a sha256 for {remote_path}"))?;
+    let file_name = remote_edit_file_name(remote_path);
+    let temp_dir = create_edit_temp_dir()?;
+    let local_path = temp_dir.join(file_name);
+    let inline_edit = stat.size.unwrap_or(0) <= DEFAULT_INLINE_EDIT_MAX_BYTES;
+
+    if inline_edit {
+        let result = remote_fs_read(&addr, remote_path, ContentEncoding::Base64, None).await?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(result.content)
+            .context("failed to decode inline edit content")?;
+        if result.truncated {
+            bail!("remote file exceeded inline edit limit: {remote_path}");
+        }
+        write_local_edit_file(&local_path, &bytes, remote_mode).await?;
+    } else {
+        execute_pull(
+            &addr,
+            &[remote_path.to_string()],
+            local_path.to_string_lossy().as_ref(),
+        )
+        .await?;
+    }
+
+    let original_local_sha256 = sha256_local_path(&local_path)?;
+    let editor_command = resolve_editor_command(editor)?;
+    let editor_status = launch_editor(&editor_command, &local_path)?;
+    if !editor_status.success() {
+        bail!(
+            "editor exited with status {}; kept local copy at {}",
+            editor_status.code().unwrap_or(-1),
+            local_path.display()
+        );
+    }
+
+    let edited_local_sha256 = sha256_local_path(&local_path)?;
+    if edited_local_sha256 == original_local_sha256 {
+        remove_edit_temp_dir(&temp_dir)?;
+        println!("no changes\t{}\t{}", display_addr(&addr), remote_path);
+        return Ok(());
+    }
+
+    let write_result = if inline_edit {
+        let bytes = fs::read(&local_path)
+            .with_context(|| format!("failed to read edited file {}", local_path.display()))?;
+        let content = base64::engine::general_purpose::STANDARD.encode(bytes);
+        remote_fs_write(
+            &addr,
+            remote_path,
+            content,
+            ContentEncoding::Base64,
+            Some(remote_mode),
+            true,
+            Some(original_remote_sha256.clone()),
+        )
+        .await
+        .map(|_| ())
+    } else {
+        let latest_stat = remote_fs_stat(&addr, remote_path, Some(HashAlgorithm::Sha256)).await?;
+        let latest_sha256 = latest_stat.sha256.ok_or_else(|| {
+            anyhow!("remote stat did not include a sha256 for {remote_path} during save")
+        })?;
+        if latest_sha256 != original_remote_sha256 {
+            bail!(
+                "remote file changed while editing {}; kept local copy at {}",
+                remote_path,
+                local_path.display()
+            );
+        }
+        execute_push(
+            &addr,
+            &[local_path.to_string_lossy().into_owned()],
+            remote_path,
+        )
+        .await
+        .map(|_| ())
+    };
+
+    if let Err(err) = write_result {
+        bail!("{err}; kept local copy at {}", local_path.display());
+    }
+
+    remove_edit_temp_dir(&temp_dir)?;
+    println!("updated\t{}\t{}", display_addr(&addr), remote_path);
+    Ok(())
+}
+
 async fn execute_push(
     addr: &str,
     source_specs: &[String],
@@ -3402,6 +3523,84 @@ async fn execute_pull(
                 entries,
             })
         }
+        ControlResponse::Error { code, message } => {
+            Err(RemoteControlError { code, message }.into())
+        }
+        other => bail!("unexpected response from daemon: {other:?}"),
+    }
+}
+
+async fn remote_fs_stat(
+    addr: &str,
+    path: &str,
+    hash: Option<HashAlgorithm>,
+) -> Result<AgentFsStat> {
+    match request(
+        addr,
+        ControlRequest::FsStat {
+            path: path.to_string(),
+            hash,
+        },
+    )
+    .await?
+    {
+        ControlResponse::FsStat { stat } => Ok(stat),
+        ControlResponse::Error { code, message } => {
+            Err(RemoteControlError { code, message }.into())
+        }
+        other => bail!("unexpected response from daemon: {other:?}"),
+    }
+}
+
+async fn remote_fs_read(
+    addr: &str,
+    path: &str,
+    encoding: ContentEncoding,
+    max_bytes: Option<u64>,
+) -> Result<AgentFsReadResult> {
+    match request(
+        addr,
+        ControlRequest::FsRead {
+            path: path.to_string(),
+            encoding,
+            max_bytes,
+        },
+    )
+    .await?
+    {
+        ControlResponse::FsReadResult { result } => Ok(result),
+        ControlResponse::Error { code, message } => {
+            Err(RemoteControlError { code, message }.into())
+        }
+        other => bail!("unexpected response from daemon: {other:?}"),
+    }
+}
+
+async fn remote_fs_write(
+    addr: &str,
+    path: &str,
+    content: String,
+    encoding: ContentEncoding,
+    mode: Option<u32>,
+    atomic: bool,
+    if_sha256: Option<String>,
+) -> Result<AgentFsWriteResult> {
+    match request(
+        addr,
+        ControlRequest::FsWrite {
+            path: path.to_string(),
+            content,
+            encoding,
+            mode,
+            create_parent: false,
+            atomic,
+            if_missing: false,
+            if_sha256,
+        },
+    )
+    .await?
+    {
+        ControlResponse::FsWriteResult { result } => Ok(result),
         ControlResponse::Error { code, message } => {
             Err(RemoteControlError { code, message }.into())
         }
@@ -4177,6 +4376,93 @@ async fn request(addr: &str, request: ControlRequest) -> Result<ControlResponse>
     read_response(&mut stream).await
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditorCommand {
+    program: String,
+    args: Vec<String>,
+}
+
+fn resolve_editor_command(override_value: Option<&str>) -> Result<EditorCommand> {
+    let raw = override_value
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| env::var("RSDB_EDITOR").ok())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| env::var("VISUAL").ok())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| env::var("EDITOR").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "vi".to_string());
+
+    let mut parts = raw
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let program = parts
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("editor command must not be empty"))?;
+    let mut args = parts.split_off(1);
+    if editor_needs_wait_flag(&program) && !args.iter().any(|arg| arg == "--wait") {
+        args.push("--wait".to_string());
+    }
+    Ok(EditorCommand { program, args })
+}
+
+fn editor_needs_wait_flag(program: &str) -> bool {
+    matches!(
+        Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(program),
+        "code" | "code-insiders" | "codium"
+    )
+}
+
+fn launch_editor(editor: &EditorCommand, path: &Path) -> Result<std::process::ExitStatus> {
+    std::process::Command::new(&editor.program)
+        .args(&editor.args)
+        .arg(path)
+        .status()
+        .with_context(|| format!("failed to launch editor `{}`", editor.program))
+}
+
+fn create_edit_temp_dir() -> Result<PathBuf> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let path = env::temp_dir().join(format!("rsdb-edit-{nonce}"));
+    fs::create_dir_all(&path)
+        .with_context(|| format!("failed to create temp dir {}", path.display()))?;
+    Ok(path)
+}
+
+fn remove_edit_temp_dir(path: &Path) -> Result<()> {
+    fs::remove_dir_all(path)
+        .with_context(|| format!("failed to remove temp dir {}", path.display()))
+}
+
+fn remote_edit_file_name(remote_path: &str) -> String {
+    Path::new(remote_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("rsdb-edit")
+        .to_string()
+}
+
+async fn write_local_edit_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    let mut file = create_local_output_file(path, mode).await?;
+    file.write_all(bytes)
+        .await
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.flush()
+        .await
+        .with_context(|| format!("failed to flush {}", path.display()))?;
+    Ok(())
+}
+
 async fn open_connection(addr: &str) -> Result<TcpStream> {
     debug!(target_addr = %addr, "opening tcp connection");
     let stream = timeout(Duration::from_secs(5), TcpStream::connect(addr))
@@ -4745,5 +5031,20 @@ mod tests {
         assert_eq!(filtered.files.len(), 1);
         assert_eq!(filtered.files[0].root_index, 0);
         assert_eq!(filtered.total_bytes, 7);
+    }
+
+    #[test]
+    fn resolve_editor_command_adds_wait_for_code() {
+        let editor = resolve_editor_command(Some("code")).expect("editor should resolve");
+        assert_eq!(editor.program, "code");
+        assert_eq!(editor.args, vec!["--wait"]);
+    }
+
+    #[test]
+    fn resolve_editor_command_preserves_existing_wait_flag() {
+        let editor = resolve_editor_command(Some("code --wait --reuse-window"))
+            .expect("editor should resolve");
+        assert_eq!(editor.program, "code");
+        assert_eq!(editor.args, vec!["--wait", "--reuse-window"]);
     }
 }
