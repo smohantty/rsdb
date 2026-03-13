@@ -22,8 +22,8 @@ use rsdb_proto::{
     DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest, DiscoveryResponse, FrameKind, FsEntryKind,
     HEADER_LEN, HashAlgorithm, MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION, StreamChannel,
     TransferEntry, TransferEntryKind, TransferRoot, decode_discovery_message, decode_json,
-    decode_stream_frame, encode_discovery_message, read_frame, write_json_frame,
-    write_stream_frame,
+    decode_stream_frame, encode_discovery_message, read_frame, read_stream_frame_into,
+    write_json_frame, write_stream_frame,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -297,12 +297,14 @@ struct DiscoveredTarget {
 
 #[derive(Debug, Clone)]
 struct LocalBatchFile {
+    root_index: u32,
     path: PathBuf,
     size: u64,
 }
 
 #[derive(Debug, Clone)]
 struct LocalBatchManifest {
+    sources: Vec<PathBuf>,
     roots: Vec<TransferRoot>,
     entries: Vec<TransferEntry>,
     files: Vec<LocalBatchFile>,
@@ -1816,18 +1818,10 @@ async fn run_agent_transfer_push(
             details.clone(),
         )
     })?;
-    let expanded_sources = expand_local_sources(source_specs).map_err(|err| {
-        map_operation_error(
-            "transfer.push",
-            Some(target.to_string()),
-            &err,
-            details.clone(),
-        )
-    })?;
     let final_root_paths = resolve_remote_batch_roots(target, destination, &manifest.roots).await?;
 
     if !atomic && !if_changed {
-        let summary = execute_push(target, source_specs, destination)
+        let summary = execute_push_manifest(target, &manifest, destination)
             .await
             .map_err(|err| {
                 map_operation_error(
@@ -1838,7 +1832,7 @@ async fn run_agent_transfer_push(
                 )
             })?;
         if let Some(mode) = verify {
-            for (source, remote_root) in expanded_sources.iter().zip(final_root_paths.iter()) {
+            for (source, remote_root) in manifest.sources.iter().zip(final_root_paths.iter()) {
                 let local_state = collect_local_transfer_state(source, verify_uses_hash(mode))
                     .map_err(|err| {
                         map_operation_error(
@@ -1887,7 +1881,8 @@ async fn run_agent_transfer_push(
     let mut bytes_written = 0_u64;
     let mut changed_roots = 0_u64;
 
-    for (index, (source, remote_root)) in expanded_sources
+    for (index, (source, remote_root)) in manifest
+        .sources
         .iter()
         .zip(final_root_paths.iter())
         .enumerate()
@@ -1917,9 +1912,22 @@ async fn run_agent_transfer_push(
         let temp_root_string = temp_root.display().to_string();
         let final_root_string = remote_root.display().to_string();
         let source_string = source.display().to_string();
-        let single_source = vec![source_string.clone()];
+        let manifest_source_string = source_string.clone();
+        let manifest_destination_string = final_root_string.clone();
+        let single_manifest =
+            filter_local_batch_manifest(&manifest, &[index as u32]).map_err(|err| {
+                map_operation_error(
+                    "transfer.push",
+                    Some(target.to_string()),
+                    &err,
+                    serde_json::json!({
+                        "source": manifest_source_string,
+                        "destination": manifest_destination_string,
+                    }),
+                )
+            })?;
 
-        let push_result = execute_push(target, &single_source, &temp_root_string).await;
+        let push_result = execute_push_manifest(target, &single_manifest, &temp_root_string).await;
         let push_summary = match push_result {
             Ok(summary) => summary,
             Err(err) => {
@@ -1949,7 +1957,7 @@ async fn run_agent_transfer_push(
     }
 
     if let Some(mode) = verify {
-        for (source, remote_root) in expanded_sources.iter().zip(final_root_paths.iter()) {
+        for (source, remote_root) in manifest.sources.iter().zip(final_root_paths.iter()) {
             let local_state = collect_local_transfer_state(source, verify_uses_hash(mode))
                 .map_err(|err| {
                     map_operation_error(
@@ -3266,6 +3274,14 @@ async fn execute_push(
     remote_path: &str,
 ) -> Result<PushSummary> {
     let manifest = build_local_batch_manifest(source_specs)?;
+    execute_push_manifest(addr, &manifest, remote_path).await
+}
+
+async fn execute_push_manifest(
+    addr: &str,
+    manifest: &LocalBatchManifest,
+    remote_path: &str,
+) -> Result<PushSummary> {
     let mut stream = open_connection(&addr).await?;
     write_json_frame(
         &mut stream,
@@ -3417,7 +3433,7 @@ fn build_local_batch_manifest(source_specs: &[String]) -> Result<LocalBatchManif
     let mut files = Vec::new();
     let mut total_bytes = 0_u64;
 
-    for source in sources {
+    for source in &sources {
         let metadata = fs::symlink_metadata(&source)
             .with_context(|| format!("failed to stat local path {}", source.display()))?;
         if metadata.file_type().is_symlink() {
@@ -3455,6 +3471,7 @@ fn build_local_batch_manifest(source_specs: &[String]) -> Result<LocalBatchManif
 
     ensure_unique_root_names(&roots)?;
     Ok(LocalBatchManifest {
+        sources,
         roots,
         entries,
         files,
@@ -3560,11 +3577,72 @@ fn append_local_manifest_entry(
         size,
     });
     files.push(LocalBatchFile {
+        root_index,
         path: path.to_path_buf(),
         size,
     });
     *total_bytes += size;
     Ok(())
+}
+
+fn filter_local_batch_manifest(
+    manifest: &LocalBatchManifest,
+    root_indexes: &[u32],
+) -> Result<LocalBatchManifest> {
+    let mut remapped_indexes = BTreeMap::new();
+    let mut sources = Vec::with_capacity(root_indexes.len());
+    let mut roots = Vec::with_capacity(root_indexes.len());
+
+    for (new_index, root_index) in root_indexes.iter().copied().enumerate() {
+        let root_usize = root_index as usize;
+        let source = manifest
+            .sources
+            .get(root_usize)
+            .ok_or_else(|| anyhow!("invalid local batch manifest root index {root_index}"))?;
+        let root = manifest
+            .roots
+            .get(root_usize)
+            .ok_or_else(|| anyhow!("invalid local batch manifest root index {root_index}"))?;
+        remapped_indexes.insert(root_index, new_index as u32);
+        sources.push(source.clone());
+        roots.push(root.clone());
+    }
+
+    let entries = manifest
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            remapped_indexes
+                .get(&entry.root_index)
+                .map(|&mapped_root_index| {
+                    let mut entry = entry.clone();
+                    entry.root_index = mapped_root_index;
+                    entry
+                })
+        })
+        .collect::<Vec<_>>();
+    let files = manifest
+        .files
+        .iter()
+        .filter_map(|file| {
+            remapped_indexes
+                .get(&file.root_index)
+                .map(|&mapped_root_index| {
+                    let mut file = file.clone();
+                    file.root_index = mapped_root_index;
+                    file
+                })
+        })
+        .collect::<Vec<_>>();
+    let total_bytes = files.iter().map(|file| file.size).sum();
+
+    Ok(LocalBatchManifest {
+        sources,
+        roots,
+        entries,
+        files,
+        total_bytes,
+    })
 }
 
 async fn stream_local_batch_files(stream: &mut TcpStream, files: &[LocalBatchFile]) -> Result<u64> {
@@ -3622,6 +3700,7 @@ async fn receive_local_batch(
     let root_paths = resolve_local_batch_roots(destination, destination_arg, roots)?;
     let mut entries_received = 0_u64;
     let mut bytes_received = 0_u64;
+    let mut chunk_payload = Vec::with_capacity(DEFAULT_STREAM_CHUNK_SIZE);
 
     for entry in entries {
         let output_path = resolve_transfer_entry_path(&root_paths, entry)?;
@@ -3648,25 +3727,26 @@ async fn receive_local_batch(
                 let mut file = create_local_output_file(&output_path, entry.mode).await?;
                 let mut remaining = entry.size;
                 while remaining > 0 {
-                    let chunk = read_file_stream_chunk(stream, "pull").await?;
+                    let chunk =
+                        read_file_stream_chunk_into(stream, "pull", &mut chunk_payload).await?;
                     if chunk.eof {
                         bail!(
                             "unexpected end of pull stream while writing {}",
                             output_path.display()
                         );
                     }
-                    if chunk.payload.len() as u64 > remaining {
+                    if chunk_payload.len() as u64 > remaining {
                         bail!(
                             "pull stream overflow while writing {}",
                             output_path.display()
                         );
                     }
-                    if !chunk.payload.is_empty() {
-                        file.write_all(&chunk.payload).await.with_context(|| {
+                    if !chunk_payload.is_empty() {
+                        file.write_all(&chunk_payload).await.with_context(|| {
                             format!("failed to write {}", output_path.display())
                         })?;
-                        remaining -= chunk.payload.len() as u64;
-                        bytes_received += chunk.payload.len() as u64;
+                        remaining -= chunk_payload.len() as u64;
+                        bytes_received += chunk_payload.len() as u64;
                     }
                 }
                 file.flush().await?;
@@ -3686,24 +3766,18 @@ async fn receive_local_batch(
         entries_received += 1;
     }
 
-    expect_file_stream_eof(stream, "pull").await?;
+    expect_file_stream_eof(stream, "pull", &mut chunk_payload).await?;
     Ok((entries_received, bytes_received))
 }
 
-async fn read_file_stream_chunk(
+async fn read_file_stream_chunk_into(
     stream: &mut TcpStream,
     context_name: &str,
-) -> Result<rsdb_proto::StreamFrame> {
-    let frame = read_frame(stream)
+    payload: &mut Vec<u8>,
+) -> Result<rsdb_proto::StreamFrameHeader> {
+    let chunk = read_stream_frame_into(stream, payload)
         .await
         .with_context(|| format!("failed to read {context_name} frame"))?;
-    if frame.header.kind != FrameKind::Stream {
-        bail!(
-            "unexpected frame kind during {context_name}: {:?}",
-            frame.header.kind
-        );
-    }
-    let chunk = decode_stream_frame(frame).context("invalid stream frame")?;
     ensure_request_id(chunk.request_id, REQUEST_ID)?;
     if chunk.channel != StreamChannel::File {
         bail!(
@@ -3714,9 +3788,13 @@ async fn read_file_stream_chunk(
     Ok(chunk)
 }
 
-async fn expect_file_stream_eof(stream: &mut TcpStream, context_name: &str) -> Result<()> {
-    let chunk = read_file_stream_chunk(stream, context_name).await?;
-    if !chunk.eof || !chunk.payload.is_empty() {
+async fn expect_file_stream_eof(
+    stream: &mut TcpStream,
+    context_name: &str,
+    payload: &mut Vec<u8>,
+) -> Result<()> {
+    let chunk = read_file_stream_chunk_into(stream, context_name, payload).await?;
+    if !chunk.eof || !payload.is_empty() {
         bail!("expected end of {context_name} file stream");
     }
     Ok(())
@@ -4600,5 +4678,72 @@ mod tests {
         ]);
 
         assert!(transfer_states_match(&expected, &actual));
+    }
+
+    #[test]
+    fn filter_local_batch_manifest_remaps_roots_and_files() {
+        let manifest = LocalBatchManifest {
+            sources: vec![PathBuf::from("alpha"), PathBuf::from("beta")],
+            roots: vec![
+                TransferRoot {
+                    source_name: "alpha".to_string(),
+                    kind: TransferEntryKind::Directory,
+                    mode: 0,
+                },
+                TransferRoot {
+                    source_name: "beta".to_string(),
+                    kind: TransferEntryKind::File,
+                    mode: 0,
+                },
+            ],
+            entries: vec![
+                TransferEntry {
+                    root_index: 0,
+                    relative_path: String::new(),
+                    kind: TransferEntryKind::Directory,
+                    mode: 0,
+                    size: 0,
+                },
+                TransferEntry {
+                    root_index: 0,
+                    relative_path: "nested.txt".to_string(),
+                    kind: TransferEntryKind::File,
+                    mode: 0,
+                    size: 3,
+                },
+                TransferEntry {
+                    root_index: 1,
+                    relative_path: String::new(),
+                    kind: TransferEntryKind::File,
+                    mode: 0,
+                    size: 7,
+                },
+            ],
+            files: vec![
+                LocalBatchFile {
+                    root_index: 0,
+                    path: PathBuf::from("alpha/nested.txt"),
+                    size: 3,
+                },
+                LocalBatchFile {
+                    root_index: 1,
+                    path: PathBuf::from("beta"),
+                    size: 7,
+                },
+            ],
+            total_bytes: 10,
+        };
+
+        let filtered =
+            filter_local_batch_manifest(&manifest, &[1]).expect("root filter should succeed");
+
+        assert_eq!(filtered.sources, vec![PathBuf::from("beta")]);
+        assert_eq!(filtered.roots.len(), 1);
+        assert_eq!(filtered.roots[0].source_name, "beta");
+        assert_eq!(filtered.entries.len(), 1);
+        assert_eq!(filtered.entries[0].root_index, 0);
+        assert_eq!(filtered.files.len(), 1);
+        assert_eq!(filtered.files[0].root_index, 0);
+        assert_eq!(filtered.total_bytes, 7);
     }
 }

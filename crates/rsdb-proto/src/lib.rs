@@ -122,6 +122,13 @@ pub struct StreamFrame {
     pub payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamFrameHeader {
+    pub request_id: u32,
+    pub channel: StreamChannel,
+    pub eof: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilitySet {
     pub protocol_version: u16,
@@ -521,6 +528,33 @@ where
     let mut payload = vec![0_u8; header.payload_len as usize];
     reader.read_exact(&mut payload).await?;
     Ok(Frame { header, payload })
+}
+
+pub async fn read_stream_frame_into<R>(
+    reader: &mut R,
+    payload: &mut Vec<u8>,
+) -> Result<StreamFrameHeader, ProtocolError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header_bytes = [0_u8; HEADER_LEN];
+    reader.read_exact(&mut header_bytes).await?;
+    let header = FrameHeader::decode(header_bytes)?;
+    if header.kind != FrameKind::Stream {
+        return Err(ProtocolError::UnexpectedFrameKind {
+            expected: FrameKind::Stream,
+            actual: header.kind,
+        });
+    }
+
+    payload.resize(header.payload_len as usize, 0);
+    reader.read_exact(payload).await?;
+
+    Ok(StreamFrameHeader {
+        request_id: header.request_id,
+        channel: StreamChannel::from_u32(header.flags & STREAM_CHANNEL_MASK)?,
+        eof: header.flags & STREAM_EOF_FLAG != 0,
+    })
 }
 
 pub async fn write_json_frame<W, T>(

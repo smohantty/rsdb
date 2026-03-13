@@ -21,7 +21,7 @@ use rsdb_proto::{
     FrameKind, FsEntryKind, HEADER_LEN, HashAlgorithm, MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION,
     ProtocolError, StreamChannel, TransferEntry, TransferEntryKind, TransferRoot,
     decode_discovery_message, decode_json, decode_stream_frame, encode_discovery_message,
-    read_frame, write_json_frame, write_stream_frame,
+    read_frame, read_stream_frame_into, write_json_frame, write_stream_frame,
 };
 use rustix_openpty::rustix::fd::IntoRawFd as _;
 use rustix_openpty::rustix::termios::Winsize;
@@ -1452,14 +1452,14 @@ async fn handle_push(
     .await?;
 
     let mut bytes_written = 0_u64;
+    let mut chunk_payload = Vec::with_capacity(DEFAULT_STREAM_CHUNK_SIZE);
     loop {
-        let frame = read_frame(stream).await?;
-        let chunk = decode_stream_frame(frame)?;
-        expect_stream_chunk(&chunk, request_id, StreamChannel::File)?;
+        let chunk =
+            read_file_stream_chunk_into(stream, request_id, "push", &mut chunk_payload).await?;
 
-        if !chunk.payload.is_empty() {
-            file.write_all(&chunk.payload).await?;
-            bytes_written += chunk.payload.len() as u64;
+        if !chunk_payload.is_empty() {
+            file.write_all(&chunk_payload).await?;
+            bytes_written += chunk_payload.len() as u64;
         }
 
         if chunk.eof {
@@ -1590,6 +1590,7 @@ async fn handle_push_batch(
 
     let mut entries_written = 0_u64;
     let mut bytes_written = 0_u64;
+    let mut chunk_payload = Vec::with_capacity(DEFAULT_STREAM_CHUNK_SIZE);
     for entry in entries {
         let output_path = resolve_transfer_entry_path(&root_paths, entry)?;
         match entry.kind {
@@ -1636,23 +1637,25 @@ async fn handle_push_batch(
                 })?;
                 let mut remaining = entry.size;
                 while remaining > 0 {
-                    let chunk = read_file_stream_chunk(stream, request_id, "push").await?;
+                    let chunk =
+                        read_file_stream_chunk_into(stream, request_id, "push", &mut chunk_payload)
+                            .await?;
                     if chunk.eof {
                         bail!(
                             "unexpected end of push stream while writing {}",
                             output_path.display()
                         );
                     }
-                    if chunk.payload.len() as u64 > remaining {
+                    if chunk_payload.len() as u64 > remaining {
                         bail!(
                             "push stream overflow while writing {}",
                             output_path.display()
                         );
                     }
-                    if !chunk.payload.is_empty() {
-                        file.write_all(&chunk.payload).await?;
-                        remaining -= chunk.payload.len() as u64;
-                        bytes_written += chunk.payload.len() as u64;
+                    if !chunk_payload.is_empty() {
+                        file.write_all(&chunk_payload).await?;
+                        remaining -= chunk_payload.len() as u64;
+                        bytes_written += chunk_payload.len() as u64;
                     }
                 }
 
@@ -1673,7 +1676,7 @@ async fn handle_push_batch(
         entries_written += 1;
     }
 
-    expect_file_stream_eof(stream, request_id, "push").await?;
+    expect_file_stream_eof(stream, request_id, "push", &mut chunk_payload).await?;
     write_json_frame(
         stream,
         FrameKind::Response,
@@ -1936,22 +1939,29 @@ async fn stream_batch_files(
     Ok(total_bytes)
 }
 
-async fn read_file_stream_chunk(
+async fn read_file_stream_chunk_into(
     stream: &mut TcpStream,
     request_id: u32,
     context_name: &str,
-) -> Result<rsdb_proto::StreamFrame> {
-    let frame = read_frame(stream)
+    payload: &mut Vec<u8>,
+) -> Result<rsdb_proto::StreamFrameHeader> {
+    let chunk = read_stream_frame_into(stream, payload)
         .await
         .with_context(|| format!("failed to read {context_name} frame"))?;
-    if frame.header.kind != FrameKind::Stream {
+    if chunk.request_id != request_id {
         bail!(
-            "unexpected frame kind during {context_name}: {:?}",
-            frame.header.kind
+            "stream frame request id mismatch: expected {}, got {}",
+            request_id,
+            chunk.request_id
         );
     }
-    let chunk = decode_stream_frame(frame)?;
-    expect_stream_chunk(&chunk, request_id, StreamChannel::File)?;
+    if chunk.channel != StreamChannel::File {
+        bail!(
+            "unexpected stream channel: expected {:?}, got {:?}",
+            StreamChannel::File,
+            chunk.channel
+        );
+    }
     Ok(chunk)
 }
 
@@ -1959,9 +1969,10 @@ async fn expect_file_stream_eof(
     stream: &mut TcpStream,
     request_id: u32,
     context_name: &str,
+    payload: &mut Vec<u8>,
 ) -> Result<()> {
-    let chunk = read_file_stream_chunk(stream, request_id, context_name).await?;
-    if !chunk.eof || !chunk.payload.is_empty() {
+    let chunk = read_file_stream_chunk_into(stream, request_id, context_name, payload).await?;
+    if !chunk.eof || !payload.is_empty() {
         bail!("expected end of {context_name} file stream");
     }
     Ok(())
