@@ -185,7 +185,9 @@ REMOTE_ROOT="/tmp/rsdb-agent-regression-$(date +%s)"
 SCHEMA_OUTPUT="$LOCAL_ROOT/schema.json"
 DISCOVER_OUTPUT="$LOCAL_ROOT/discover.json"
 EXEC_OUTPUT="$LOCAL_ROOT/exec.json"
+EXEC_CWD_OUTPUT="$LOCAL_ROOT/exec-cwd.json"
 EXEC_CHECK_OUTPUT="$LOCAL_ROOT/exec-check.json"
+EXEC_TIMEOUT_OUTPUT="$LOCAL_ROOT/exec-timeout.json"
 EXEC_STREAM_OUTPUT="$LOCAL_ROOT/exec-stream.jsonl"
 FS_MKDIR_OUTPUT="$LOCAL_ROOT/fs-mkdir.json"
 FS_MKDIR_REPEAT_OUTPUT="$LOCAL_ROOT/fs-mkdir-repeat.json"
@@ -281,6 +283,19 @@ assert obj["data"]["status"] == 0, obj
 assert obj["data"]["stdout"] == "agent-exec-ok\n", obj
 PY
 
+agent_cmd fs mkdir "$REMOTE_ROOT/cwd" --parents >/dev/null
+agent_cmd exec --cwd "$REMOTE_ROOT/cwd" -- pwd > "$EXEC_CWD_OUTPUT"
+assert_json_success "$EXEC_CWD_OUTPUT" "exec"
+python3 - "$EXEC_CWD_OUTPUT" "$REMOTE_ROOT/cwd" <<'PY'
+import json
+import pathlib
+import sys
+
+obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert obj["data"]["cwd"] == sys.argv[2], obj
+assert obj["data"]["stdout"].strip() == sys.argv[2], obj
+PY
+
 if agent_cmd exec --check -- sh -c 'printf check-failed 1>&2; exit 7' > "$EXEC_CHECK_OUTPUT"; then
     echo "error: exec --check unexpectedly succeeded for a nonzero exit status" >&2
     exit 1
@@ -295,6 +310,12 @@ obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert obj["error"]["details"]["status"] == 7, obj
 assert "check-failed" in obj["error"]["details"]["stderr"], obj
 PY
+
+if agent_cmd exec --timeout-secs 1 -- sh -c 'sleep 2' > "$EXEC_TIMEOUT_OUTPUT"; then
+    echo "error: exec --timeout-secs unexpectedly succeeded for a timed out command" >&2
+    exit 1
+fi
+assert_json_failure_code "$EXEC_TIMEOUT_OUTPUT" "exec" "exec.timeout"
 
 agent_cmd exec --stream -- sh -c 'printf out; printf err 1>&2' > "$EXEC_STREAM_OUTPUT"
 assert_exec_stream "$EXEC_STREAM_OUTPUT"

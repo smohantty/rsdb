@@ -343,10 +343,21 @@ async fn handle_request(
         ControlRequest::Exec {
             command,
             args,
+            cwd,
+            timeout_secs,
             stream: stream_output,
         } => {
-            return handle_exec_request(stream, request_id, &command, &args, stream_output, state)
-                .await;
+            return handle_exec_request(
+                stream,
+                request_id,
+                &command,
+                &args,
+                cwd.as_deref(),
+                timeout_secs,
+                stream_output,
+                state,
+            )
+            .await;
         }
         ControlRequest::FsStat { path, hash } => {
             if let Err(err) = handle_fs_stat(&mut stream, request_id, &path, hash).await {
@@ -540,11 +551,23 @@ async fn handle_exec_request(
     request_id: u32,
     command: &str,
     args: &[String],
+    cwd: Option<&str>,
+    timeout_secs: Option<u64>,
     stream_output: bool,
     state: &ServerState,
 ) -> Result<()> {
     if stream_output {
-        return match stream_command_output(&mut stream, request_id, command, args).await {
+        return match stream_command_output(
+            &mut stream,
+            request_id,
+            command,
+            args,
+            cwd,
+            timeout_secs,
+            state,
+        )
+        .await
+        {
             Ok(()) => Ok(()),
             Err(err) => {
                 let response = ControlResponse::Error {
@@ -557,7 +580,7 @@ async fn handle_exec_request(
         };
     }
 
-    let response = match execute_command(command, args, state).await {
+    let response = match execute_command(command, args, cwd, timeout_secs, state).await {
         Ok(result) => result,
         Err(err) => ControlResponse::Error {
             code: ErrorCode::ExecFailed,
@@ -571,6 +594,8 @@ async fn handle_exec_request(
 async fn execute_command(
     command: &str,
     args: &[String],
+    cwd: Option<&str>,
+    timeout_secs: Option<u64>,
     state: &ServerState,
 ) -> Result<ControlResponse> {
     if command.trim().is_empty() {
@@ -579,13 +604,27 @@ async fn execute_command(
 
     let mut child = Command::new(command);
     child.args(args);
+    if let Some(cwd) = cwd {
+        child.current_dir(cwd);
+    }
     child.stdout(Stdio::piped());
     child.stderr(Stdio::piped());
+    child.kill_on_drop(true);
 
-    let output = timeout(state.exec_timeout, child.output())
-        .await
-        .context("command timed out")?
-        .with_context(|| format!("failed to execute command: {command}"))?;
+    let exec_timeout_duration = exec_timeout(timeout_secs, state.exec_timeout);
+
+    let output = match timeout(exec_timeout_duration, child.output()).await {
+        Ok(output) => output.with_context(|| format!("failed to execute command: {command}"))?,
+        Err(_) => {
+            return Ok(ControlResponse::Error {
+                code: ErrorCode::ExecTimeout,
+                message: format!(
+                    "command timed out after {} seconds",
+                    exec_timeout_duration.as_secs()
+                ),
+            });
+        }
+    };
 
     let status = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -604,91 +643,128 @@ async fn stream_command_output(
     request_id: u32,
     command: &str,
     args: &[String],
+    cwd: Option<&str>,
+    timeout_secs: Option<u64>,
+    state: &ServerState,
 ) -> Result<()> {
     if command.trim().is_empty() {
         bail!("command must not be empty");
     }
 
-    let mut child = Command::new(command);
-    child.args(args);
-    child.stdout(Stdio::piped());
-    child.stderr(Stdio::piped());
+    let exec_timeout_duration = exec_timeout(timeout_secs, state.exec_timeout);
+    let stream_result = timeout(exec_timeout_duration, async {
+        let mut child = Command::new(command);
+        child.args(args);
+        if let Some(cwd) = cwd {
+            child.current_dir(cwd);
+        }
+        child.stdout(Stdio::piped());
+        child.stderr(Stdio::piped());
+        child.kill_on_drop(true);
 
-    let mut child = child
-        .spawn()
-        .with_context(|| format!("failed to execute command: {command}"))?;
-    let mut child_stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("child stdout was not captured"))?;
-    let mut child_stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("child stderr was not captured"))?;
+        let mut child = child
+            .spawn()
+            .with_context(|| format!("failed to execute command: {command}"))?;
+        let mut child_stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("child stdout was not captured"))?;
+        let mut child_stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("child stderr was not captured"))?;
 
-    let mut writer = tokio::io::BufWriter::new(&mut *stream);
-    let mut stdout_open = true;
-    let mut stderr_open = true;
-    let mut exit_status = None;
-    let mut wait = Box::pin(child.wait());
-    let mut stdout_buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
-    let mut stderr_buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
+        let mut writer = tokio::io::BufWriter::new(&mut *stream);
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let mut exit_status = None;
+        let mut wait = Box::pin(child.wait());
+        let mut stdout_buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
+        let mut stderr_buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
 
-    while stdout_open || stderr_open || exit_status.is_none() {
-        tokio::select! {
-            read = child_stdout.read(&mut stdout_buffer), if stdout_open => {
-                let read = read?;
-                if read == 0 {
-                    stdout_open = false;
-                    write_stream_frame(&mut writer, request_id, StreamChannel::Stdout, true, &[]).await?;
-                } else {
-                    write_stream_frame(
-                        &mut writer,
-                        request_id,
-                        StreamChannel::Stdout,
-                        false,
-                        &stdout_buffer[..read],
-                    ).await?;
+        while stdout_open || stderr_open || exit_status.is_none() {
+            tokio::select! {
+                read = child_stdout.read(&mut stdout_buffer), if stdout_open => {
+                    let read = read?;
+                    if read == 0 {
+                        stdout_open = false;
+                        write_stream_frame(&mut writer, request_id, StreamChannel::Stdout, true, &[]).await?;
+                    } else {
+                        write_stream_frame(
+                            &mut writer,
+                            request_id,
+                            StreamChannel::Stdout,
+                            false,
+                            &stdout_buffer[..read],
+                        ).await?;
+                    }
                 }
-            }
-            read = child_stderr.read(&mut stderr_buffer), if stderr_open => {
-                let read = read?;
-                if read == 0 {
-                    stderr_open = false;
-                    write_stream_frame(&mut writer, request_id, StreamChannel::Stderr, true, &[]).await?;
-                } else {
-                    write_stream_frame(
-                        &mut writer,
-                        request_id,
-                        StreamChannel::Stderr,
-                        false,
-                        &stderr_buffer[..read],
-                    ).await?;
+                read = child_stderr.read(&mut stderr_buffer), if stderr_open => {
+                    let read = read?;
+                    if read == 0 {
+                        stderr_open = false;
+                        write_stream_frame(&mut writer, request_id, StreamChannel::Stderr, true, &[]).await?;
+                    } else {
+                        write_stream_frame(
+                            &mut writer,
+                            request_id,
+                            StreamChannel::Stderr,
+                            false,
+                            &stderr_buffer[..read],
+                        ).await?;
+                    }
                 }
-            }
-            status = &mut wait, if exit_status.is_none() => {
-                exit_status = Some(status.context("failed to wait for exec process")?);
+                status = &mut wait, if exit_status.is_none() => {
+                    exit_status = Some(status.context("failed to wait for exec process")?);
+                }
             }
         }
-    }
 
-    let status = match exit_status {
-        Some(status) => status,
-        None => wait.await.context("failed to wait for exec process")?,
-    };
-    write_json_frame(
-        &mut writer,
-        FrameKind::Response,
-        request_id,
-        &ControlResponse::ExecResult {
-            status: status.code().unwrap_or(-1),
-            stdout: String::new(),
-            stderr: String::new(),
-            timed_out: false,
-        },
-    )
-    .await?;
-    Ok(())
+        let status = match exit_status {
+            Some(status) => status,
+            None => wait.await.context("failed to wait for exec process")?,
+        };
+        write_json_frame(
+            &mut writer,
+            FrameKind::Response,
+            request_id,
+            &ControlResponse::ExecResult {
+                status: status.code().unwrap_or(-1),
+                stdout: String::new(),
+                stderr: String::new(),
+                timed_out: false,
+            },
+        )
+        .await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await;
+
+    match stream_result {
+        Ok(result) => result,
+        Err(_) => {
+            write_json_frame(
+                stream,
+                FrameKind::Response,
+                request_id,
+                &ControlResponse::Error {
+                    code: ErrorCode::ExecTimeout,
+                    message: format!(
+                        "command timed out after {} seconds",
+                        exec_timeout_duration.as_secs()
+                    ),
+                },
+            )
+            .await?;
+            Ok(())
+        }
+    }
+}
+
+fn exec_timeout(timeout_secs: Option<u64>, default_timeout: Duration) -> Duration {
+    timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or(default_timeout)
 }
 
 async fn handle_fs_stat(

@@ -284,6 +284,10 @@ pub enum ControlRequest {
         command: String,
         args: Vec<String>,
         #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+        #[serde(default)]
         stream: bool,
     },
     FsStat {
@@ -656,6 +660,8 @@ mod tests {
         let request = ControlRequest::Exec {
             command: "echo".to_string(),
             args: vec!["hello".to_string()],
+            cwd: Some("/tmp".to_string()),
+            timeout_secs: Some(5),
             stream: false,
         };
 

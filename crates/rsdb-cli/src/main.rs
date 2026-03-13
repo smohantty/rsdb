@@ -144,6 +144,10 @@ enum AgentCommands {
         stream: bool,
         #[arg(long)]
         check: bool,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long)]
+        timeout_secs: Option<u64>,
         #[arg(
             value_name = "COMMAND",
             trailing_var_arg = true,
@@ -423,6 +427,7 @@ struct AgentExecCompletionData {
     target: String,
     command: String,
     args: Vec<String>,
+    cwd: Option<String>,
     status: i32,
     timed_out: bool,
     duration_ms: u64,
@@ -968,8 +973,10 @@ async fn agent_command(target: Option<&str>, command: AgentCommands) -> Result<i
         AgentCommands::Exec {
             stream,
             check,
+            cwd,
+            timeout_secs,
             command,
-        } => agent_exec_command(target, stream, check, &command).await,
+        } => agent_exec_command(target, stream, check, cwd.as_deref(), timeout_secs, &command).await,
         AgentCommands::Fs { command } => agent_fs_command(target, command).await,
         AgentCommands::Transfer { command } => agent_transfer_command(target, command).await,
     }
@@ -1040,6 +1047,8 @@ async fn agent_exec_command(
     target: Option<&str>,
     stream: bool,
     check: bool,
+    cwd: Option<&str>,
+    timeout_secs: Option<u64>,
     command: &[String],
 ) -> Result<i32> {
     let target = match require_agent_target(target) {
@@ -1062,12 +1071,12 @@ async fn agent_exec_command(
     };
 
     let exit_code = if stream {
-        match run_agent_exec_stream(&target, &program, &args, check).await {
+        match run_agent_exec_stream(&target, &program, &args, cwd, timeout_secs, check).await {
             Ok(code) => code,
             Err(err) => return emit_agent_failure("exec", err),
         }
     } else {
-        match run_agent_exec(&target, &program, &args, check).await {
+        match run_agent_exec(&target, &program, &args, cwd, timeout_secs, check).await {
             Ok(code) => code,
             Err(err) => return emit_agent_failure("exec", err),
         }
@@ -1239,6 +1248,8 @@ async fn run_agent_exec(
     target: &str,
     program: &str,
     args: &[String],
+    cwd: Option<&str>,
+    timeout_secs: Option<u64>,
     check: bool,
 ) -> AgentResult<i32> {
     let started = Instant::now();
@@ -1247,6 +1258,8 @@ async fn run_agent_exec(
         ControlRequest::Exec {
             command: program.to_string(),
             args: args.to_vec(),
+            cwd: cwd.map(ToOwned::to_owned),
+            timeout_secs,
             stream: false,
         },
     )
@@ -1264,7 +1277,7 @@ async fn run_agent_exec(
                 target: target.to_string(),
                 command: program.to_string(),
                 args: args.to_vec(),
-                cwd: None,
+                cwd: cwd.map(ToOwned::to_owned),
                 status,
                 timed_out,
                 stdout,
@@ -1284,6 +1297,8 @@ async fn run_agent_exec(
             serde_json::json!({
                 "command": program,
                 "args": args,
+                "cwd": cwd,
+                "timeout_secs": timeout_secs,
                 "duration_ms": elapsed_ms(started),
             }),
         )),
@@ -1297,6 +1312,8 @@ async fn run_agent_exec_stream(
     target: &str,
     program: &str,
     args: &[String],
+    cwd: Option<&str>,
+    timeout_secs: Option<u64>,
     check: bool,
 ) -> AgentResult<i32> {
     let started = Instant::now();
@@ -1310,6 +1327,8 @@ async fn run_agent_exec_stream(
         &ControlRequest::Exec {
             command: program.to_string(),
             args: args.to_vec(),
+            cwd: cwd.map(ToOwned::to_owned),
+            timeout_secs,
             stream: true,
         },
     )
@@ -1419,6 +1438,7 @@ async fn run_agent_exec_stream(
                             target: target.to_string(),
                             command: program.to_string(),
                             args: args.to_vec(),
+                            cwd: cwd.map(ToOwned::to_owned),
                             status,
                             timed_out,
                             duration_ms: elapsed_ms(started),
@@ -1446,6 +1466,8 @@ async fn run_agent_exec_stream(
                             serde_json::json!({
                                 "command": program,
                                 "args": args,
+                                "cwd": cwd,
+                                "timeout_secs": timeout_secs,
                                 "duration_ms": elapsed_ms(started),
                             }),
                         );
@@ -2736,6 +2758,8 @@ fn agent_schema() -> AgentSchemaData {
                 options: vec![
                     schema_option("stream", "bool", false, false),
                     schema_option("check", "bool", false, false),
+                    schema_option("cwd", "string", false, false),
+                    schema_option("timeout-secs", "u64", false, false),
                 ],
                 positional: vec![schema_positional("command", "string", true, true)],
             },
@@ -3072,6 +3096,7 @@ fn exec_nonzero_failure(target: String, data: &AgentExecData) -> AgentCommandFai
         retryable: false,
         details: serde_json::json!({
             "status": data.status,
+            "cwd": data.cwd,
             "stdout": data.stdout,
             "stderr": data.stderr,
             "duration_ms": data.duration_ms,
@@ -3092,6 +3117,7 @@ fn exec_nonzero_failure_from_completion(
         retryable: false,
         details: serde_json::json!({
             "status": data.status,
+            "cwd": data.cwd,
             "duration_ms": data.duration_ms,
             "timed_out": data.timed_out,
         }),
@@ -4476,7 +4502,7 @@ mod tests {
             .iter()
             .map(|option| option.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(option_names, vec!["stream", "check"]);
+        assert_eq!(option_names, vec!["stream", "check", "cwd", "timeout-secs"]);
         assert!(exec.target_required);
         assert_eq!(exec.positional.len(), 1);
         assert_eq!(exec.positional[0].name, "command");
