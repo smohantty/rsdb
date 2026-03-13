@@ -31,6 +31,7 @@ use tokio::fs::{File, OpenOptions, metadata};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::process::Command;
+use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 use tracing::{debug, trace, warn};
 
@@ -777,21 +778,11 @@ async fn handle_fs_stat(
     hash: Option<HashAlgorithm>,
 ) -> Result<()> {
     let requested = validate_fs_path(path)?;
-    let stat = match std::fs::symlink_metadata(&requested) {
-        Ok(metadata) => build_fs_stat(&requested, &metadata, hash.as_ref())?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => AgentFsStat {
-            path: requested.display().to_string(),
-            exists: false,
-            kind: None,
-            size: None,
-            mode: None,
-            mtime_unix_ms: None,
-            sha256: None,
-        },
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to stat {}", requested.display()));
-        }
-    };
+    let stat = run_blocking_fs({
+        let requested = requested.clone();
+        move || blocking_fs_stat(requested, hash)
+    })
+    .await?;
 
     write_json_frame(
         stream,
@@ -813,23 +804,11 @@ async fn handle_fs_list(
     hash: Option<HashAlgorithm>,
 ) -> Result<()> {
     let requested = validate_fs_path(path)?;
-    let metadata = std::fs::symlink_metadata(&requested)
-        .with_context(|| format!("failed to stat {}", requested.display()))?;
-    let mut entries = Vec::new();
-
-    if metadata.is_dir() {
-        collect_fs_entries(
-            &requested,
-            recursive,
-            max_depth,
-            include_hidden,
-            hash.as_ref(),
-            0,
-            &mut entries,
-        )?;
-    } else {
-        entries.push(build_fs_entry(&requested, &metadata, hash.as_ref())?);
-    }
+    let entries = run_blocking_fs({
+        let requested = requested.clone();
+        move || blocking_fs_list(requested, recursive, max_depth, include_hidden, hash)
+    })
+    .await?;
 
     write_json_frame(
         stream,
@@ -1197,6 +1176,60 @@ fn validate_fs_path(path: &str) -> Result<PathBuf> {
         return Err(FsInvalidRequestError("path must not be empty".to_string()).into());
     }
     Ok(path)
+}
+
+async fn run_blocking_fs<F, T>(operation: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    spawn_blocking(operation)
+        .await
+        .map_err(|err| anyhow!("blocking fs task failed: {err}"))?
+}
+
+fn blocking_fs_stat(path: PathBuf, hash: Option<HashAlgorithm>) -> Result<AgentFsStat> {
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => build_fs_stat(&path, &metadata, hash.as_ref()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(AgentFsStat {
+            path: path.display().to_string(),
+            exists: false,
+            kind: None,
+            size: None,
+            mode: None,
+            mtime_unix_ms: None,
+            sha256: None,
+        }),
+        Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
+    }
+}
+
+fn blocking_fs_list(
+    path: PathBuf,
+    recursive: bool,
+    max_depth: Option<u32>,
+    include_hidden: bool,
+    hash: Option<HashAlgorithm>,
+) -> Result<Vec<AgentFsEntry>> {
+    let metadata = std::fs::symlink_metadata(&path)
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    let mut entries = Vec::new();
+
+    if metadata.is_dir() {
+        collect_fs_entries(
+            &path,
+            recursive,
+            max_depth,
+            include_hidden,
+            hash.as_ref(),
+            0,
+            &mut entries,
+        )?;
+    } else {
+        entries.push(build_fs_entry(&path, &metadata, hash.as_ref())?);
+    }
+
+    Ok(entries)
 }
 
 fn build_fs_stat(
