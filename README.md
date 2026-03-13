@@ -68,3 +68,28 @@ If the service does not come up after install, the RPM prints the exact commands
 
 - The default port for discovery and control traffic is `27101`
 - If you want quieter daemon logs after install, set `RUST_LOG=off` in `/etc/rsdbd.env` and restart `rsdbd.service`
+
+## Local Loopback Dev Mode
+
+For fast host-side development, you can run both the CLI and the daemon on the
+same Linux machine over loopback TCP:
+
+```bash
+./scripts/dev/local-loopback.sh
+```
+
+That command:
+
+- builds `rsdb` and `rsdbd`
+- starts `rsdbd` on `127.0.0.1:27131`
+- uses an isolated `XDG_CONFIG_HOME` under a temp run directory
+- runs `cargo test --workspace`
+- runs the existing shell/transfer and agent regression smoke scripts against the local daemon
+
+If you want to keep the daemon running for repeated manual checks:
+
+```bash
+./scripts/dev/local-loopback-up.sh
+./scripts/test/local-loopback-smoke.sh --run-dir /tmp/rsdb-loopback-XXXXXX
+./scripts/dev/local-loopback-down.sh --run-dir /tmp/rsdb-loopback-XXXXXX
+```
