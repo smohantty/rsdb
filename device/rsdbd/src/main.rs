@@ -698,6 +698,7 @@ async fn stream_command_output(
                             &stdout_buffer[..read],
                         ).await?;
                     }
+                    writer.flush().await?;
                 }
                 read = child_stderr.read(&mut stderr_buffer), if stderr_open => {
                     let read = read?;
@@ -713,6 +714,7 @@ async fn stream_command_output(
                             &stderr_buffer[..read],
                         ).await?;
                     }
+                    writer.flush().await?;
                 }
                 status = &mut wait, if exit_status.is_none() => {
                     exit_status = Some(status.context("failed to wait for exec process")?);
@@ -736,6 +738,7 @@ async fn stream_command_output(
             },
         )
         .await?;
+        writer.flush().await?;
         Ok::<(), anyhow::Error>(())
     })
     .await;
@@ -1929,6 +1932,7 @@ async fn stream_batch_files(
         }
     }
 
+    writer.flush().await?;
     Ok(total_bytes)
 }
 
@@ -2144,6 +2148,7 @@ async fn handle_pipe_shell(
         },
     )
     .await?;
+    writer.flush().await?;
 
     let mut child_stdin = child
         .stdin
@@ -2188,6 +2193,7 @@ async fn handle_pipe_shell(
                     }
                     Some(Err(err)) => {
                         send_error(&mut writer, request_id, ErrorCode::ExecFailed, err.into()).await?;
+                        writer.flush().await?;
                         return Ok(());
                     }
                     None => {
@@ -2210,6 +2216,7 @@ async fn handle_pipe_shell(
                         &stdout_buffer[..read],
                     ).await?;
                 }
+                writer.flush().await?;
             }
             read = child_stderr.read(&mut stderr_buffer), if stderr_open => {
                 let read = read?;
@@ -2225,6 +2232,7 @@ async fn handle_pipe_shell(
                         &stderr_buffer[..read],
                     ).await?;
                 }
+                writer.flush().await?;
             }
             status = &mut wait, if exit_status.is_none() => {
                 exit_status = Some(status.context("failed to wait for shell process")?);
@@ -2249,6 +2257,7 @@ async fn handle_pipe_shell(
         },
     )
     .await?;
+    writer.flush().await?;
     Ok(())
 }
 
@@ -2288,6 +2297,7 @@ async fn handle_pty_shell(
         },
     )
     .await?;
+    writer.flush().await?;
 
     let controller_reader = controller
         .try_clone()
@@ -2349,10 +2359,12 @@ async fn handle_pty_shell(
                             &data,
                         )
                         .await?;
+                        writer.flush().await?;
                     }
                     Some(PtyOutput::Eof) | None => {
                         stdout_open = false;
                         write_stream_frame(&mut writer, request_id, StreamChannel::Stdout, true, &[]).await?;
+                        writer.flush().await?;
                     }
                     Some(PtyOutput::Error(message)) => {
                         return Err(anyhow!("PTY stream failed: {message}"));
@@ -2375,6 +2387,7 @@ async fn handle_pty_shell(
         },
     )
     .await?;
+    writer.flush().await?;
     Ok(())
 }
 

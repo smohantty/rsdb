@@ -976,7 +976,17 @@ async fn agent_command(target: Option<&str>, command: AgentCommands) -> Result<i
             cwd,
             timeout_secs,
             command,
-        } => agent_exec_command(target, stream, check, cwd.as_deref(), timeout_secs, &command).await,
+        } => {
+            agent_exec_command(
+                target,
+                stream,
+                check,
+                cwd.as_deref(),
+                timeout_secs,
+                &command,
+            )
+            .await
+        }
         AgentCommands::Fs { command } => agent_fs_command(target, command).await,
         AgentCommands::Transfer { command } => agent_transfer_command(target, command).await,
     }
@@ -3595,6 +3605,10 @@ async fn stream_local_batch_files(stream: &mut TcpStream, files: &[LocalBatchFil
         }
     }
 
+    writer
+        .flush()
+        .await
+        .context("failed to flush push stream")?;
     Ok(total_bytes)
 }
 
@@ -3898,6 +3912,10 @@ async fn run_shell_session(
         write_stream_frame(&mut writer, REQUEST_ID, StreamChannel::Stdin, true, &[])
             .await
             .context("failed to close remote stdin")?;
+        writer
+            .flush()
+            .await
+            .context("failed to flush remote stdin close")?;
     }
 
     loop {
@@ -3915,12 +3933,20 @@ async fn run_shell_session(
                         )
                         .await
                         .context("failed to forward stdin")?;
+                        writer
+                            .flush()
+                            .await
+                            .context("failed to flush forwarded stdin")?;
                     }
                     Some(StdinChunk::Eof) | None => {
                         trace!("forwarding shell stdin eof");
                         write_stream_frame(&mut writer, REQUEST_ID, StreamChannel::Stdin, true, &[])
                             .await
                             .context("failed to finish stdin stream")?;
+                        writer
+                            .flush()
+                            .await
+                            .context("failed to flush stdin eof")?;
                         stdin_open = false;
                         stdin_rx = None;
                     }
@@ -4519,7 +4545,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(fs_operations.len(), 7);
-        assert!(fs_operations.iter().all(|operation| operation.target_required));
+        assert!(
+            fs_operations
+                .iter()
+                .all(|operation| operation.target_required)
+        );
     }
 
     #[test]

@@ -508,7 +508,6 @@ where
 
     writer.write_all(&header.encode()).await?;
     writer.write_all(payload).await?;
-    writer.flush().await?;
     Ok(())
 }
 
@@ -598,7 +597,6 @@ where
 
     writer.write_all(&header.encode()).await?;
     writer.write_all(payload).await?;
-    writer.flush().await?;
     Ok(())
 }
 
