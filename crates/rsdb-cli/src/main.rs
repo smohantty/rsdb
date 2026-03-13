@@ -128,6 +128,13 @@ enum Commands {
         #[arg(value_name = "REMOTE_PATH")]
         path: String,
     },
+    #[command(hide = true, name = "__complete-edit-path")]
+    CompleteEditPath {
+        #[arg(long, value_name = "ADDR")]
+        target: Option<String>,
+        #[arg(long, default_value = "")]
+        partial: String,
+    },
     /// Machine-facing agent command surface.
     Agent {
         #[arg(long, global = true, value_name = "ADDR")]
@@ -572,6 +579,10 @@ async fn main() -> Result<()> {
             path,
         } => {
             edit_command(target.as_deref(), editor.as_deref(), &path).await?;
+            0
+        }
+        Commands::CompleteEditPath { target, partial } => {
+            complete_edit_path_command(target.as_deref(), &partial).await?;
             0
         }
         Commands::Agent { target, command } => agent_command(target.as_deref(), command).await?,
@@ -3389,6 +3400,14 @@ async fn edit_command(target: Option<&str>, editor: Option<&str>, remote_path: &
     Ok(())
 }
 
+async fn complete_edit_path_command(target: Option<&str>, partial: &str) -> Result<()> {
+    let addr = resolve_target(target)?;
+    for candidate in complete_remote_edit_path(&addr, partial).await? {
+        println!("{candidate}");
+    }
+    Ok(())
+}
+
 async fn execute_push(
     addr: &str,
     source_specs: &[String],
@@ -3601,6 +3620,31 @@ async fn remote_fs_write(
     .await?
     {
         ControlResponse::FsWriteResult { result } => Ok(result),
+        ControlResponse::Error { code, message } => {
+            Err(RemoteControlError { code, message }.into())
+        }
+        other => bail!("unexpected response from daemon: {other:?}"),
+    }
+}
+
+async fn remote_fs_list_completion(addr: &str, path: &str) -> Result<Vec<AgentFsEntry>> {
+    match request(
+        addr,
+        ControlRequest::FsList {
+            path: path.to_string(),
+            recursive: false,
+            max_depth: None,
+            include_hidden: true,
+            hash: None,
+        },
+    )
+    .await?
+    {
+        ControlResponse::FsList { entries } => Ok(entries),
+        ControlResponse::Error {
+            code: rsdb_proto::ErrorCode::FsNotFound | rsdb_proto::ErrorCode::NotFound,
+            ..
+        } => Ok(Vec::new()),
         ControlResponse::Error { code, message } => {
             Err(RemoteControlError { code, message }.into())
         }
@@ -4376,6 +4420,64 @@ async fn request(addr: &str, request: ControlRequest) -> Result<ControlResponse>
     read_response(&mut stream).await
 }
 
+async fn complete_remote_edit_path(addr: &str, partial: &str) -> Result<Vec<String>> {
+    let (parent, prefix) = split_remote_completion_input(partial);
+    let entries = remote_fs_list_completion(addr, &parent).await?;
+    let mut results = entries
+        .into_iter()
+        .filter_map(|entry| {
+            let name = Path::new(&entry.path)
+                .file_name()
+                .and_then(|value| value.to_str())?;
+            if !name.starts_with(&prefix) {
+                return None;
+            }
+            let mut candidate = join_remote_completion_candidate(&parent, name);
+            if matches!(entry.kind, FsEntryKind::Directory) {
+                candidate.push('/');
+            }
+            Some(candidate)
+        })
+        .collect::<Vec<_>>();
+    results.sort();
+    results.dedup();
+    Ok(results)
+}
+
+fn split_remote_completion_input(partial: &str) -> (String, String) {
+    if partial.is_empty() {
+        return (".".to_string(), String::new());
+    }
+    if partial == "/" {
+        return ("/".to_string(), String::new());
+    }
+    if partial.ends_with('/') {
+        return (trim_trailing_slash_preserving_root(partial), String::new());
+    }
+    if let Some((parent, prefix)) = partial.rsplit_once('/') {
+        let parent = if parent.is_empty() { "/" } else { parent };
+        return (parent.to_string(), prefix.to_string());
+    }
+    (".".to_string(), partial.to_string())
+}
+
+fn trim_trailing_slash_preserving_root(value: &str) -> String {
+    let trimmed = value.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn join_remote_completion_candidate(parent: &str, name: &str) -> String {
+    match parent {
+        "." => name.to_string(),
+        "/" => format!("/{name}"),
+        _ => format!("{parent}/{name}"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EditorCommand {
     program: String,
@@ -5031,6 +5133,41 @@ mod tests {
         assert_eq!(filtered.files.len(), 1);
         assert_eq!(filtered.files[0].root_index, 0);
         assert_eq!(filtered.total_bytes, 7);
+    }
+
+    #[test]
+    fn split_remote_completion_input_handles_empty_root_and_relative_values() {
+        assert_eq!(
+            split_remote_completion_input(""),
+            (".".to_string(), String::new())
+        );
+        assert_eq!(
+            split_remote_completion_input("/"),
+            ("/".to_string(), String::new())
+        );
+        assert_eq!(
+            split_remote_completion_input("etc"),
+            (".".to_string(), "etc".to_string())
+        );
+    }
+
+    #[test]
+    fn split_remote_completion_input_handles_parent_and_directory_prefixes() {
+        assert_eq!(
+            split_remote_completion_input("/tmp/rs"),
+            ("/tmp".to_string(), "rs".to_string())
+        );
+        assert_eq!(
+            split_remote_completion_input("/tmp/work/"),
+            ("/tmp/work".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn join_remote_completion_candidate_handles_relative_and_root_paths() {
+        assert_eq!(join_remote_completion_candidate(".", "app"), "app");
+        assert_eq!(join_remote_completion_candidate("/", "app"), "/app");
+        assert_eq!(join_remote_completion_candidate("/tmp", "app"), "/tmp/app");
     }
 
     #[test]
