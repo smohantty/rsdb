@@ -236,6 +236,8 @@ import pathlib
 import sys
 
 obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert obj["data"]["response_envelope"] == "schema_version, command, ok, data?, error?", obj
+assert obj["data"]["error_fields"] == "code, message, target?, retryable, details?", obj
 names = {operation["name"] for operation in obj["data"]["operations"]}
 assert {
     "schema",
@@ -251,11 +253,36 @@ assert {
     "transfer.push",
     "transfer.pull",
 } <= names, obj
+exec_schema = next(
+    operation for operation in obj["data"]["operations"] if operation["name"] == "exec"
+)
+assert exec_schema["returns"] == (
+    "target, command, args[], cwd?, status, timed_out, stdout, stderr, duration_ms"
+), obj
+assert "stream_events" in exec_schema, obj
+discover_schema = next(
+    operation for operation in obj["data"]["operations"] if operation["name"] == "discover"
+)
+discover_option_names = [option["name"] for option in discover_schema["options"]]
+assert discover_option_names == ["probe-addr", "timeout-ms"], obj
+read_schema = next(
+    operation for operation in obj["data"]["operations"] if operation["name"] == "fs.read"
+)
+read_encoding = next(
+    option for option in read_schema["options"] if option["name"] == "encoding"
+)
+assert read_encoding["default"] == "utf8", obj
+write_schema = next(
+    operation for operation in obj["data"]["operations"] if operation["name"] == "fs.write"
+)
+write_encoding = next(
+    option for option in write_schema["options"] if option["name"] == "encoding"
+)
+assert write_encoding["default"] == "utf8", obj
 PY
 
 "$RSDB_BIN" agent discover \
     --probe-addr "$TARGET_HOST" \
-    --port "$TARGET_PORT" \
     --timeout-ms 500 > "$DISCOVER_OUTPUT"
 assert_json_success "$DISCOVER_OUTPUT" "discover"
 python3 - "$DISCOVER_OUTPUT" "$TARGET" <<'PY'

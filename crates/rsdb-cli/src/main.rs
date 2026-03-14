@@ -82,8 +82,6 @@ enum Commands {
     Discover {
         #[arg(long, default_value = "255.255.255.255")]
         probe_addr: String,
-        #[arg(long, default_value_t = DEFAULT_RSDB_PORT)]
-        port: u16,
         #[arg(long, default_value_t = 1000)]
         timeout_ms: u64,
     },
@@ -152,8 +150,6 @@ enum AgentCommands {
     Discover {
         #[arg(long, default_value = "255.255.255.255")]
         probe_addr: String,
-        #[arg(long, default_value_t = DEFAULT_RSDB_PORT)]
-        port: u16,
         #[arg(long, default_value_t = 1000)]
         timeout_ms: u64,
     },
@@ -387,6 +383,8 @@ struct AgentDiscoverTarget {
 struct AgentSchemaData {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     usage_rules: Vec<String>,
+    response_envelope: String,
+    error_fields: String,
     operations: Vec<AgentSchemaOperation>,
 }
 
@@ -400,6 +398,9 @@ struct AgentSchemaOperation {
     options: Vec<AgentSchemaOption>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     positional: Vec<AgentSchemaPositional>,
+    returns: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_events: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -407,6 +408,8 @@ struct AgentSchemaOption {
     name: String,
     #[serde(rename = "type")]
     kind: String,
+    #[serde(rename = "default", skip_serializing_if = "Option::is_none")]
+    default_value: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     required: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -545,10 +548,9 @@ async fn main() -> Result<()> {
         }
         Commands::Discover {
             probe_addr,
-            port,
             timeout_ms,
         } => {
-            discover_command(&probe_addr, port, timeout_ms).await?;
+            discover_command(&probe_addr, timeout_ms).await?;
             0
         }
         Commands::Ping { target } => {
@@ -778,8 +780,8 @@ async fn devices_command() -> Result<()> {
     Ok(())
 }
 
-async fn discover_command(probe_addr: &str, port: u16, timeout_ms: u64) -> Result<()> {
-    let targets = discover_targets(probe_addr, port, timeout_ms).await?;
+async fn discover_command(probe_addr: &str, timeout_ms: u64) -> Result<()> {
+    let targets = discover_targets(probe_addr, timeout_ms).await?;
     if targets.is_empty() {
         println!("no devices discovered");
         return Ok(());
@@ -836,14 +838,10 @@ async fn discover_command(probe_addr: &str, port: u16, timeout_ms: u64) -> Resul
     Ok(())
 }
 
-async fn discover_targets(
-    probe_addr: &str,
-    port: u16,
-    timeout_ms: u64,
-) -> Result<Vec<DiscoveredTarget>> {
+async fn discover_targets(probe_addr: &str, timeout_ms: u64) -> Result<Vec<DiscoveredTarget>> {
     let mut discovered = BTreeMap::<String, DiscoveredTarget>::new();
     for probe_ip in discovery_probe_addresses(probe_addr)? {
-        for target in discover_targets_once(probe_ip, port, timeout_ms).await? {
+        for target in discover_targets_once(probe_ip, DEFAULT_RSDB_PORT, timeout_ms).await? {
             let key = format!("{}@{}", target.device_name, target.addr);
             discovered.insert(key, target);
         }
@@ -1000,9 +998,8 @@ async fn agent_command(target: Option<&str>, command: AgentCommands) -> Result<i
         AgentCommands::Schema => agent_schema_command(target).await,
         AgentCommands::Discover {
             probe_addr,
-            port,
             timeout_ms,
-        } => agent_discover_command(target, &probe_addr, port, timeout_ms).await,
+        } => agent_discover_command(target, &probe_addr, timeout_ms).await,
         AgentCommands::Exec {
             stream,
             check,
@@ -1044,7 +1041,6 @@ async fn agent_schema_command(target: Option<&str>) -> Result<i32> {
 async fn agent_discover_command(
     target: Option<&str>,
     probe_addr: &str,
-    port: u16,
     timeout_ms: u64,
 ) -> Result<i32> {
     if target.is_some() {
@@ -1058,7 +1054,7 @@ async fn agent_discover_command(
         );
     }
 
-    let targets = match discover_targets(probe_addr, port, timeout_ms).await {
+    let targets = match discover_targets(probe_addr, timeout_ms).await {
         Ok(targets) => targets,
         Err(err) => {
             return emit_agent_failure("discover", map_transport_error("discover", None, &err));
@@ -2780,6 +2776,8 @@ fn agent_schema() -> AgentSchemaData {
             "pass --target for every target-scoped operation".to_string(),
             "use -- before the remote command argv for exec".to_string(),
         ],
+        response_envelope: "schema_version, command, ok, data?, error?".to_string(),
+        error_fields: "code, message, target?, retryable, details?".to_string(),
         operations: vec![
             AgentSchemaOperation {
                 name: "schema".to_string(),
@@ -2787,6 +2785,9 @@ fn agent_schema() -> AgentSchemaData {
                 target_required: false,
                 options: Vec::new(),
                 positional: Vec::new(),
+                returns:
+                    "usage_rules[], response_envelope, error_fields, operations[]".to_string(),
+                stream_events: None,
             },
             AgentSchemaOperation {
                 name: "discover".to_string(),
@@ -2795,10 +2796,11 @@ fn agent_schema() -> AgentSchemaData {
                 target_required: false,
                 options: vec![
                     schema_option("probe-addr", "string", false, false),
-                    schema_option("port", "u16", false, false),
                     schema_option("timeout-ms", "u64", false, false),
                 ],
                 positional: Vec::new(),
+                returns: "targets[{target,server_id,device_name?,platform?,protocol_version,compatible,supported_operations[]}]".to_string(),
+                stream_events: None,
             },
             AgentSchemaOperation {
                 name: "exec".to_string(),
@@ -2811,6 +2813,10 @@ fn agent_schema() -> AgentSchemaData {
                     schema_option("timeout-secs", "u64", false, false),
                 ],
                 positional: vec![schema_positional("command", "string", true, true)],
+                returns:
+                    "target, command, args[], cwd?, status, timed_out, stdout, stderr, duration_ms"
+                        .to_string(),
+                stream_events: Some("stdout{target,chunk}; stderr{target,chunk}; completed{target,command,args[],cwd?,status,timed_out,duration_ms}; failed{error,data?}".to_string()),
             },
             AgentSchemaOperation {
                 name: "fs.stat".to_string(),
@@ -2818,6 +2824,9 @@ fn agent_schema() -> AgentSchemaData {
                 target_required: true,
                 options: vec![schema_option("hash", "enum(sha256)", false, false)],
                 positional: vec![schema_positional("path", "string", true, false)],
+                returns: "path, exists, kind?, size?, mode?, mtime_unix_ms?, sha256?"
+                    .to_string(),
+                stream_events: None,
             },
             AgentSchemaOperation {
                 name: "fs.list".to_string(),
@@ -2830,16 +2839,26 @@ fn agent_schema() -> AgentSchemaData {
                     schema_option("hash", "enum(sha256)", false, false),
                 ],
                 positional: vec![schema_positional("path", "string", true, false)],
+                returns: "entries[{path,kind,size,mode,mtime_unix_ms?,sha256?}]".to_string(),
+                stream_events: None,
             },
             AgentSchemaOperation {
                 name: "fs.read".to_string(),
                 purpose: "read one small remote file inline".to_string(),
                 target_required: true,
                 options: vec![
-                    schema_option("encoding", "enum(utf8|base64)", false, false),
+                    schema_option_with_default(
+                        "encoding",
+                        "enum(utf8|base64)",
+                        "utf8",
+                        false,
+                        false,
+                    ),
                     schema_option("max-bytes", "u64", false, false),
                 ],
                 positional: vec![schema_positional("path", "string", true, false)],
+                returns: "path, encoding, content, bytes, truncated".to_string(),
+                stream_events: None,
             },
             AgentSchemaOperation {
                 name: "fs.write".to_string(),
@@ -2848,7 +2867,13 @@ fn agent_schema() -> AgentSchemaData {
                 options: vec![
                     schema_option("input-file", "string", false, false),
                     schema_option("stdin", "bool", false, false),
-                    schema_option("encoding", "enum(utf8|base64)", false, false),
+                    schema_option_with_default(
+                        "encoding",
+                        "enum(utf8|base64)",
+                        "utf8",
+                        false,
+                        false,
+                    ),
                     schema_option("mode", "octal-string", false, false),
                     schema_option("create-parent", "bool", false, false),
                     schema_option("atomic", "bool", false, false),
@@ -2856,6 +2881,8 @@ fn agent_schema() -> AgentSchemaData {
                     schema_option("if-sha256", "string", false, false),
                 ],
                 positional: vec![schema_positional("path", "string", true, false)],
+                returns: "path, bytes_written, mode?, sha256?, changed".to_string(),
+                stream_events: None,
             },
             AgentSchemaOperation {
                 name: "fs.mkdir".to_string(),
@@ -2866,6 +2893,8 @@ fn agent_schema() -> AgentSchemaData {
                     schema_option("mode", "octal-string", false, false),
                 ],
                 positional: vec![schema_positional("path", "string", true, false)],
+                returns: "path, created".to_string(),
+                stream_events: None,
             },
             AgentSchemaOperation {
                 name: "fs.rm".to_string(),
@@ -2877,6 +2906,8 @@ fn agent_schema() -> AgentSchemaData {
                     schema_option("if-exists", "bool", false, false),
                 ],
                 positional: vec![schema_positional("path", "string", true, false)],
+                returns: "path, removed".to_string(),
+                stream_events: None,
             },
             AgentSchemaOperation {
                 name: "fs.move".to_string(),
@@ -2887,6 +2918,8 @@ fn agent_schema() -> AgentSchemaData {
                     schema_positional("source", "string", true, false),
                     schema_positional("destination", "string", true, false),
                 ],
+                returns: "source, destination, overwritten".to_string(),
+                stream_events: None,
             },
             AgentSchemaOperation {
                 name: "transfer.push".to_string(),
@@ -2898,6 +2931,8 @@ fn agent_schema() -> AgentSchemaData {
                     schema_option("if-changed", "bool", false, false),
                 ],
                 positional: vec![schema_positional("paths", "string", true, true)],
+                returns: "target, sources[], destination, entries_written, bytes_written, skipped, verification?, verified, atomic".to_string(),
+                stream_events: None,
             },
             AgentSchemaOperation {
                 name: "transfer.pull".to_string(),
@@ -2905,6 +2940,8 @@ fn agent_schema() -> AgentSchemaData {
                 target_required: true,
                 options: vec![schema_option("verify", "enum(size|sha256)", false, false)],
                 positional: vec![schema_positional("paths", "string", true, true)],
+                returns: "target, sources[], destination, entries_received, bytes_received, total_bytes, verification?, verified".to_string(),
+                stream_events: None,
             },
         ],
     }
@@ -2919,6 +2956,23 @@ fn schema_option(
     AgentSchemaOption {
         name: name.to_string(),
         kind: kind.to_string(),
+        default_value: None,
+        required,
+        multiple,
+    }
+}
+
+fn schema_option_with_default(
+    name: &'static str,
+    kind: &'static str,
+    default_value: &'static str,
+    required: bool,
+    multiple: bool,
+) -> AgentSchemaOption {
+    AgentSchemaOption {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        default_value: Some(default_value.to_string()),
         required,
         multiple,
     }
@@ -4999,6 +5053,16 @@ mod tests {
         assert_eq!(exec.positional.len(), 1);
         assert_eq!(exec.positional[0].name, "command");
         assert!(exec.positional[0].multiple);
+        assert_eq!(
+            exec.returns,
+            "target, command, args[], cwd?, status, timed_out, stdout, stderr, duration_ms"
+        );
+        assert_eq!(
+            exec.stream_events.as_deref(),
+            Some(
+                "stdout{target,chunk}; stderr{target,chunk}; completed{target,command,args[],cwd?,status,timed_out,duration_ms}; failed{error,data?}"
+            )
+        );
     }
 
     #[test]
@@ -5016,6 +5080,92 @@ mod tests {
                 .iter()
                 .all(|operation| operation.target_required)
         );
+    }
+
+    #[test]
+    fn agent_schema_includes_shared_response_contract() {
+        let schema = agent_schema();
+
+        assert_eq!(
+            schema.response_envelope,
+            "schema_version, command, ok, data?, error?"
+        );
+        assert_eq!(
+            schema.error_fields,
+            "code, message, target?, retryable, details?"
+        );
+    }
+
+    #[test]
+    fn agent_schema_summarizes_operation_outputs() {
+        let schema = agent_schema();
+        let by_name = schema
+            .operations
+            .iter()
+            .map(|operation| (operation.name.as_str(), operation.returns.as_str()))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            by_name.get("schema"),
+            Some(&"usage_rules[], response_envelope, error_fields, operations[]")
+        );
+        assert_eq!(
+            by_name.get("discover"),
+            Some(
+                &"targets[{target,server_id,device_name?,platform?,protocol_version,compatible,supported_operations[]}]"
+            )
+        );
+        assert_eq!(
+            by_name.get("fs.read"),
+            Some(&"path, encoding, content, bytes, truncated")
+        );
+        assert_eq!(
+            by_name.get("transfer.push"),
+            Some(
+                &"target, sources[], destination, entries_written, bytes_written, skipped, verification?, verified, atomic"
+            )
+        );
+    }
+
+    #[test]
+    fn agent_schema_omits_discover_port_and_marks_encoding_defaults() {
+        let schema = agent_schema();
+        let discover = schema
+            .operations
+            .iter()
+            .find(|operation| operation.name == "discover")
+            .expect("discover operation should exist");
+        let read = schema
+            .operations
+            .iter()
+            .find(|operation| operation.name == "fs.read")
+            .expect("fs.read operation should exist");
+        let write = schema
+            .operations
+            .iter()
+            .find(|operation| operation.name == "fs.write")
+            .expect("fs.write operation should exist");
+
+        let discover_option_names = discover
+            .options
+            .iter()
+            .map(|option| option.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(discover_option_names, vec!["probe-addr", "timeout-ms"]);
+
+        let read_encoding = read
+            .options
+            .iter()
+            .find(|option| option.name == "encoding")
+            .expect("fs.read encoding option should exist");
+        assert_eq!(read_encoding.default_value.as_deref(), Some("utf8"));
+
+        let write_encoding = write
+            .options
+            .iter()
+            .find(|option| option.name == "encoding")
+            .expect("fs.write encoding option should exist");
+        assert_eq!(write_encoding.default_value.as_deref(), Some("utf8"));
     }
 
     #[test]
