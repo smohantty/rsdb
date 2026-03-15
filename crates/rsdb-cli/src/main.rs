@@ -381,6 +381,7 @@ struct AgentDiscoverTarget {
 
 #[derive(Debug, Serialize)]
 struct AgentSchemaData {
+    command_prefix: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     usage_rules: Vec<String>,
     response_envelope: String,
@@ -2767,14 +2768,19 @@ fn supported_agent_operations(features: &[String], compatible: bool) -> Vec<Stri
 
 fn agent_schema() -> AgentSchemaData {
     AgentSchemaData {
+        command_prefix: schema_command_prefix(),
         usage_rules: vec![
             "call discover when no target is known".to_string(),
+            "invoke an operation by replacing each '.' in operation.name with a space after command_prefix".to_string(),
+            "example: fs.read -> rsdb agent fs read".to_string(),
+            "example: transfer.pull -> rsdb agent transfer pull".to_string(),
             "use exec for direct remote process execution".to_string(),
             "use exec with --stream for long-running commands or live output".to_string(),
             "use fs.* for small structured filesystem work".to_string(),
             "use transfer.* for bulk files or directories".to_string(),
             "pass --target for every target-scoped operation".to_string(),
-            "use -- before the remote command argv for exec".to_string(),
+            "for exec, place -- before the remote command argv".to_string(),
+            "for transfer.push and transfer.pull, the last positional path is the destination; preceding paths are sources".to_string(),
         ],
         response_envelope: "schema_version, command, ok, data?, error?".to_string(),
         error_fields: "code, message, target?, retryable, details?".to_string(),
@@ -2786,7 +2792,8 @@ fn agent_schema() -> AgentSchemaData {
                 options: Vec::new(),
                 positional: Vec::new(),
                 returns:
-                    "usage_rules[], response_envelope, error_fields, operations[]".to_string(),
+                    "command_prefix[], usage_rules[], response_envelope, error_fields, operations[]"
+                        .to_string(),
                 stream_events: None,
             },
             AgentSchemaOperation {
@@ -2930,7 +2937,10 @@ fn agent_schema() -> AgentSchemaData {
                     schema_option("atomic", "bool", false, false),
                     schema_option("if-changed", "bool", false, false),
                 ],
-                positional: vec![schema_positional("paths", "string", true, true)],
+                positional: vec![
+                    schema_positional("local-sources", "string", true, true),
+                    schema_positional("remote-destination", "string", true, false),
+                ],
                 returns: "target, sources[], destination, entries_written, bytes_written, skipped, verification?, verified, atomic".to_string(),
                 stream_events: None,
             },
@@ -2939,12 +2949,19 @@ fn agent_schema() -> AgentSchemaData {
                 purpose: "pull bulk remote files or directories".to_string(),
                 target_required: true,
                 options: vec![schema_option("verify", "enum(size|sha256)", false, false)],
-                positional: vec![schema_positional("paths", "string", true, true)],
+                positional: vec![
+                    schema_positional("remote-sources", "string", true, true),
+                    schema_positional("local-destination", "string", true, false),
+                ],
                 returns: "target, sources[], destination, entries_received, bytes_received, total_bytes, verification?, verified".to_string(),
                 stream_events: None,
             },
         ],
     }
+}
+
+fn schema_command_prefix() -> Vec<String> {
+    vec!["rsdb".to_string(), "agent".to_string()]
 }
 
 fn schema_option(
@@ -5086,6 +5103,7 @@ mod tests {
     fn agent_schema_includes_shared_response_contract() {
         let schema = agent_schema();
 
+        assert_eq!(schema.command_prefix, vec!["rsdb", "agent"]);
         assert_eq!(
             schema.response_envelope,
             "schema_version, command, ok, data?, error?"
@@ -5107,7 +5125,7 @@ mod tests {
 
         assert_eq!(
             by_name.get("schema"),
-            Some(&"usage_rules[], response_envelope, error_fields, operations[]")
+            Some(&"command_prefix[], usage_rules[], response_envelope, error_fields, operations[]")
         );
         assert_eq!(
             by_name.get("discover"),
@@ -5166,6 +5184,72 @@ mod tests {
             .find(|option| option.name == "encoding")
             .expect("fs.write encoding option should exist");
         assert_eq!(write_encoding.default_value.as_deref(), Some("utf8"));
+    }
+
+    #[test]
+    fn agent_schema_exposes_invocation_rules_and_transfer_destination_roles() {
+        let schema = agent_schema();
+        let pull = schema
+            .operations
+            .iter()
+            .find(|operation| operation.name == "transfer.pull")
+            .expect("transfer.pull operation should exist");
+
+        assert!(
+            schema
+                .usage_rules
+                .contains(&"invoke an operation by replacing each '.' in operation.name with a space after command_prefix".to_string())
+        );
+        assert!(
+            schema
+                .usage_rules
+                .contains(&"example: fs.read -> rsdb agent fs read".to_string())
+        );
+        assert!(
+            schema
+                .usage_rules
+                .contains(&"example: transfer.pull -> rsdb agent transfer pull".to_string())
+        );
+        assert!(
+            schema
+                .usage_rules
+                .contains(&"for exec, place -- before the remote command argv".to_string())
+        );
+        assert!(
+            schema
+                .usage_rules
+                .contains(&"for transfer.push and transfer.pull, the last positional path is the destination; preceding paths are sources".to_string())
+        );
+
+        let pull_positional_names = pull
+            .positional
+            .iter()
+            .map(|positional| positional.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pull_positional_names,
+            vec!["remote-sources", "local-destination"]
+        );
+    }
+
+    #[test]
+    fn agent_schema_uses_named_transfer_sources_and_destinations() {
+        let schema = agent_schema();
+        let push = schema
+            .operations
+            .iter()
+            .find(|operation| operation.name == "transfer.push")
+            .expect("transfer.push operation should exist");
+
+        let push_positional_names = push
+            .positional
+            .iter()
+            .map(|positional| positional.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            push_positional_names,
+            vec!["local-sources", "remote-destination"]
+        );
     }
 
     #[test]
