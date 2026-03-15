@@ -56,6 +56,7 @@ struct ServerState {
     device_name: Arc<str>,
     platform: Arc<str>,
     shell_path: Arc<str>,
+    home_path: Arc<str>,
     exec_timeout: Duration,
     tcp_port: u16,
 }
@@ -144,11 +145,13 @@ async fn main() -> Result<()> {
     let device_name = detect_device_name();
     let platform = detect_platform();
     let shell_path = detect_default_shell();
+    let home_path = detect_default_home();
     let state = ServerState {
         server_id: Arc::from(server_id),
         device_name: Arc::from(device_name),
         platform: Arc::from(platform),
         shell_path: Arc::from(shell_path),
+        home_path: Arc::from(home_path),
         exec_timeout: Duration::from_secs(args.exec_timeout_secs),
         tcp_port: listen_addr.port(),
     };
@@ -2177,7 +2180,8 @@ async fn handle_pipe_shell(
     args: Vec<String>,
     state: &ServerState,
 ) -> Result<()> {
-    let (display_command, mut child) = spawn_pipe_shell(command, args, &state.shell_path)?;
+    let (display_command, mut child) =
+        spawn_pipe_shell(command, args, &state.shell_path, &state.home_path)?;
     let (mut reader, writer) = stream.into_split();
     let mut writer = tokio::io::BufWriter::new(writer);
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(32);
@@ -2326,7 +2330,7 @@ async fn handle_pty_shell(
     state: &ServerState,
 ) -> Result<()> {
     let (display_command, mut child, controller) =
-        spawn_pty_shell(command, args, term, rows, cols, &state.shell_path)?;
+        spawn_pty_shell(command, args, term, rows, cols, &state.shell_path, &state.home_path)?;
     let (mut reader, writer) = stream.into_split();
     let mut writer = tokio::io::BufWriter::new(writer);
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(32);
@@ -2449,6 +2453,7 @@ fn spawn_pipe_shell(
     command: Option<String>,
     args: Vec<String>,
     shell: &str,
+    home: &str,
 ) -> Result<(String, tokio::process::Child)> {
     let (display_command, program, argv) = match command {
         Some(command) if !command.trim().is_empty() => {
@@ -2469,6 +2474,7 @@ fn spawn_pipe_shell(
 
     let mut child = Command::new(&program);
     child.args(&argv);
+    child.env("HOME", home);
     child.stdin(Stdio::piped());
     child.stdout(Stdio::piped());
     child.stderr(Stdio::piped());
@@ -2486,6 +2492,7 @@ fn spawn_pty_shell(
     rows: Option<u16>,
     cols: Option<u16>,
     shell: &str,
+    home: &str,
 ) -> Result<(String, tokio::process::Child, StdFile)> {
     let (display_command, program, argv) = match command {
         Some(command) if !command.trim().is_empty() => {
@@ -2512,6 +2519,7 @@ fn spawn_pty_shell(
 
     let mut child = Command::new(&program);
     child.args(&argv);
+    child.env("HOME", home);
     if let Some(term) = term.filter(|value| !value.trim().is_empty()) {
         child.env("TERM", term);
     }
@@ -2626,6 +2634,41 @@ fn detect_default_shell() -> String {
     }
 
     "/bin/sh".to_string()
+}
+
+fn detect_default_home() -> String {
+    if let Some(home) = std::env::var("RSDB_DEFAULT_HOME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return home;
+    }
+
+    if let Some(home) = std::env::var("HOME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return home;
+    }
+
+    if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
+        for line in passwd.lines() {
+            if line.starts_with("root:") {
+                let mut fields = line.split(':');
+                let _name = fields.next();
+                let _passwd = fields.next();
+                let _uid = fields.next();
+                let _gid = fields.next();
+                let _gecos = fields.next();
+                if let Some(home) = fields.next().filter(|value| !value.trim().is_empty()) {
+                    return home.to_string();
+                }
+                break;
+            }
+        }
+    }
+
+    "/root".to_string()
 }
 
 fn classify_pull_error(err: &anyhow::Error) -> ErrorCode {
