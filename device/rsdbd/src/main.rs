@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use glob::{MatchOptions, glob_with};
 use rsdb_proto::{
-    AgentFsEntry, AgentFsMkdirResult, AgentFsMoveResult, AgentFsReadResult, AgentFsRmResult,
+    AgentFsListEntry, AgentFsMkdirResult, AgentFsMoveResult, AgentFsReadResult, AgentFsRmResult,
     AgentFsStat, AgentFsWriteResult, CapabilitySet, ContentEncoding, ControlRequest,
     ControlResponse, DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest, DiscoveryResponse, ErrorCode,
     FrameKind, FsEntryKind, HEADER_LEN, HashAlgorithm, MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION,
@@ -1210,7 +1210,7 @@ fn blocking_fs_list(
     max_depth: Option<u32>,
     include_hidden: bool,
     hash: Option<HashAlgorithm>,
-) -> Result<Vec<AgentFsEntry>> {
+) -> Result<Vec<AgentFsListEntry>> {
     let metadata = std::fs::symlink_metadata(&path)
         .with_context(|| format!("failed to stat {}", path.display()))?;
     let mut entries = Vec::new();
@@ -1258,7 +1258,7 @@ fn collect_fs_entries(
     include_hidden: bool,
     hash: Option<&HashAlgorithm>,
     depth: u32,
-    entries: &mut Vec<AgentFsEntry>,
+    entries: &mut Vec<AgentFsListEntry>,
 ) -> Result<()> {
     let mut children = std::fs::read_dir(path)
         .with_context(|| format!("failed to read directory {}", path.display()))?
@@ -1303,13 +1303,11 @@ fn build_fs_entry(
     path: &Path,
     metadata: &std::fs::Metadata,
     hash: Option<&HashAlgorithm>,
-) -> Result<AgentFsEntry> {
-    Ok(AgentFsEntry {
+) -> Result<AgentFsListEntry> {
+    Ok(AgentFsListEntry {
         path: path.display().to_string(),
         kind: fs_entry_kind(metadata),
         size: metadata.len(),
-        mode: file_mode(metadata),
-        mtime_unix_ms: metadata_mtime_unix_ms(metadata),
         sha256: match hash {
             Some(HashAlgorithm::Sha256) if metadata.is_file() => Some(sha256_path(path)?),
             _ => None,

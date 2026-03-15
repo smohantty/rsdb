@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
 use glob::{MatchOptions, glob_with};
 use rsdb_proto::{
-    AgentFsEntry, AgentFsReadResult, AgentFsStat, AgentFsWriteResult, CapabilitySet,
+    AgentFsListEntry, AgentFsReadResult, AgentFsStat, AgentFsWriteResult, CapabilitySet,
     ContentEncoding, ControlRequest, ControlResponse, DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest,
     DiscoveryResponse, FrameKind, FsEntryKind, HEADER_LEN, HashAlgorithm,
     MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION, StreamChannel, TransferEntry, TransferEntryKind,
@@ -574,8 +574,8 @@ impl From<AgentFsStat> for AgentFsStatData {
     }
 }
 
-impl From<AgentFsEntry> for AgentFsListEntryData {
-    fn from(entry: AgentFsEntry) -> Self {
+impl From<AgentFsListEntry> for AgentFsListEntryData {
+    fn from(entry: AgentFsListEntry) -> Self {
         Self {
             path: entry.path,
             kind: entry.kind,
@@ -2381,7 +2381,7 @@ async fn remote_fs_list_request(
     target: &str,
     path: &str,
     hash: Option<HashAlgorithm>,
-) -> AgentResult<Vec<AgentFsEntry>> {
+) -> AgentResult<Vec<AgentFsListEntry>> {
     match agent_request(
         "fs.list",
         target,
@@ -2639,7 +2639,7 @@ fn transfer_state_from_stat(stat: &AgentFsStat) -> AgentResult<TransferPathState
     })
 }
 
-fn transfer_state_from_entry(entry: &AgentFsEntry) -> TransferPathState {
+fn transfer_state_from_entry(entry: &AgentFsListEntry) -> TransferPathState {
     TransferPathState {
         kind: entry.kind.clone(),
         size: matches!(entry.kind, FsEntryKind::File).then_some(entry.size),
@@ -3862,7 +3862,7 @@ async fn remote_fs_write(
     }
 }
 
-async fn remote_fs_list_completion(addr: &str, path: &str) -> Result<Vec<AgentFsEntry>> {
+async fn remote_fs_list_completion(addr: &str, path: &str) -> Result<Vec<AgentFsListEntry>> {
     match request(
         addr,
         ControlRequest::FsList {
@@ -5468,12 +5468,10 @@ mod tests {
         );
 
         let list = serde_json::to_value(AgentFsListData {
-            entries: vec![AgentFsListEntryData::from(AgentFsEntry {
+            entries: vec![AgentFsListEntryData::from(AgentFsListEntry {
                 path: "/tmp/example.txt".to_string(),
                 kind: FsEntryKind::File,
                 size: 7,
-                mode: 0o644,
-                mtime_unix_ms: Some(42),
                 sha256: Some("abc".to_string()),
             })],
         })

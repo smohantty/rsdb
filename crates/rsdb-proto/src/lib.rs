@@ -231,12 +231,10 @@ pub struct AgentFsStat {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AgentFsEntry {
+pub struct AgentFsListEntry {
     pub path: String,
     pub kind: FsEntryKind,
     pub size: u64,
-    pub mode: u32,
-    pub mtime_unix_ms: Option<u64>,
     pub sha256: Option<String>,
 }
 
@@ -411,7 +409,7 @@ pub enum ControlResponse {
         stat: AgentFsStat,
     },
     FsList {
-        entries: Vec<AgentFsEntry>,
+        entries: Vec<AgentFsListEntry>,
     },
     FsReadResult {
         result: AgentFsReadResult,
