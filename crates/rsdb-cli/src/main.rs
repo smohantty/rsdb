@@ -348,8 +348,11 @@ struct AgentEventEnvelope<T> {
 struct AgentErrorBody {
     code: String,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
     retryable: bool,
+    #[serde(skip_serializing_if = "is_empty_json_object")]
     details: serde_json::Value,
 }
 
@@ -432,13 +435,13 @@ struct AgentSchemaPositional {
 struct AgentExecData {
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cwd: Option<String>,
     status: i32,
+    #[serde(default, skip_serializing_if = "is_false")]
     timed_out: bool,
-    stdout: String,
-    stderr: String,
-    duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stdout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stderr: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -452,25 +455,21 @@ struct AgentExecChunkData {
 struct AgentExecCompletionData {
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cwd: Option<String>,
     status: i32,
+    #[serde(default, skip_serializing_if = "is_false")]
     timed_out: bool,
-    duration_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
 struct AgentTransferPushData {
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
-    sources: Vec<String>,
-    destination: String,
-    entries_written: u64,
-    bytes_written: u64,
     skipped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     verification: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
     verified: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     atomic: bool,
 }
 
@@ -478,13 +477,9 @@ struct AgentTransferPushData {
 struct AgentTransferPullData {
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
-    sources: Vec<String>,
-    destination: String,
-    entries_received: u64,
-    bytes_received: u64,
-    total_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     verification: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
     verified: bool,
 }
 
@@ -509,8 +504,105 @@ struct PullSummary {
 }
 
 #[derive(Debug, Serialize)]
+struct AgentFsStatData {
+    exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<FsEntryKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentFsReadData {
+    content: String,
+    bytes: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentFsWriteData {
+    bytes_written: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    changed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentFsListEntryData {
+    path: String,
+    kind: FsEntryKind,
+    size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct AgentFsListData {
-    entries: Vec<AgentFsEntry>,
+    entries: Vec<AgentFsListEntryData>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentFsMkdirData {
+    #[serde(default, skip_serializing_if = "is_false")]
+    created: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentFsRmData {
+    #[serde(default, skip_serializing_if = "is_false")]
+    removed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentFsMoveData {
+    #[serde(default, skip_serializing_if = "is_false")]
+    overwritten: bool,
+}
+
+impl From<AgentFsStat> for AgentFsStatData {
+    fn from(stat: AgentFsStat) -> Self {
+        Self {
+            exists: stat.exists,
+            kind: stat.kind,
+            size: stat.size,
+            sha256: stat.sha256,
+        }
+    }
+}
+
+impl From<AgentFsEntry> for AgentFsListEntryData {
+    fn from(entry: AgentFsEntry) -> Self {
+        Self {
+            path: entry.path,
+            kind: entry.kind,
+            size: entry.size,
+            sha256: entry.sha256,
+        }
+    }
+}
+
+impl From<AgentFsReadResult> for AgentFsReadData {
+    fn from(result: AgentFsReadResult) -> Self {
+        Self {
+            content: result.content,
+            bytes: result.bytes,
+            truncated: result.truncated,
+        }
+    }
+}
+
+impl From<AgentFsWriteResult> for AgentFsWriteData {
+    fn from(result: AgentFsWriteResult) -> Self {
+        Self {
+            bytes_written: result.bytes_written,
+            sha256: result.sha256,
+            changed: result.changed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1267,10 +1359,6 @@ async fn agent_transfer_push_command(
                 "transfer.push",
                 AgentTransferPushData {
                     target: response_target,
-                    sources,
-                    destination,
-                    entries_written: summary.entries_written,
-                    bytes_written: summary.bytes_written,
                     skipped: summary.skipped,
                     verification: summary.verification,
                     verified: summary.verified,
@@ -1313,11 +1401,6 @@ async fn agent_transfer_pull_command(
                 "transfer.pull",
                 AgentTransferPullData {
                     target: response_target,
-                    sources,
-                    destination,
-                    entries_received: summary.entries_received,
-                    bytes_received: summary.bytes_received,
-                    total_bytes: summary.total_bytes,
                     verification: summary.verification,
                     verified: summary.verified,
                 },
@@ -1360,12 +1443,10 @@ async fn run_agent_exec(
         } => {
             let data = AgentExecData {
                 target: response_target,
-                cwd: cwd.map(ToOwned::to_owned),
                 status,
                 timed_out,
-                stdout,
-                stderr,
-                duration_ms: elapsed_ms(started),
+                stdout: into_non_empty_string(stdout),
+                stderr: into_non_empty_string(stderr),
             };
             if check && status != 0 {
                 return Err(exec_nonzero_failure(target.to_string(), &data));
@@ -1520,17 +1601,15 @@ async fn run_agent_exec_stream(
 
                         let data = AgentExecCompletionData {
                             target: response_target.clone(),
-                            cwd: cwd.map(ToOwned::to_owned),
                             status,
                             timed_out,
-                            duration_ms: elapsed_ms(started),
                         };
                         if check && status != 0 {
                             emit_agent_event_failure(
                                 "exec",
                                 "failed",
                                 exec_nonzero_failure_from_completion(target.to_string(), &data),
-                                Some(data),
+                                None::<serde_json::Value>,
                             )
                             .map_err(internal_agent_failure)?;
                             return Ok(status);
@@ -1610,7 +1689,7 @@ async fn agent_fs_stat_command(
     .await
     {
         Ok(ControlResponse::FsStat { stat }) => {
-            emit_agent_success("fs.stat", stat)?;
+            emit_agent_success("fs.stat", AgentFsStatData::from(stat))?;
             Ok(0)
         }
         Ok(other) => emit_agent_failure(
@@ -1648,7 +1727,15 @@ async fn agent_fs_list_command(
     .await
     {
         Ok(ControlResponse::FsList { entries }) => {
-            emit_agent_success("fs.list", AgentFsListData { entries })?;
+            emit_agent_success(
+                "fs.list",
+                AgentFsListData {
+                    entries: entries
+                        .into_iter()
+                        .map(AgentFsListEntryData::from)
+                        .collect(),
+                },
+            )?;
             Ok(0)
         }
         Ok(other) => emit_agent_failure(
@@ -1682,7 +1769,7 @@ async fn agent_fs_read_command(
     .await
     {
         Ok(ControlResponse::FsReadResult { result }) => {
-            emit_agent_success("fs.read", result)?;
+            emit_agent_success("fs.read", AgentFsReadData::from(result))?;
             Ok(0)
         }
         Ok(other) => emit_agent_failure(
@@ -1742,7 +1829,7 @@ async fn agent_fs_write_command(
     .await
     {
         Ok(ControlResponse::FsWriteResult { result }) => {
-            emit_agent_success("fs.write", result)?;
+            emit_agent_success("fs.write", AgentFsWriteData::from(result))?;
             Ok(0)
         }
         Ok(other) => emit_agent_failure(
@@ -1782,7 +1869,12 @@ async fn agent_fs_mkdir_command(
     .await
     {
         Ok(ControlResponse::FsMkdirResult { result }) => {
-            emit_agent_success("fs.mkdir", result)?;
+            emit_agent_success(
+                "fs.mkdir",
+                AgentFsMkdirData {
+                    created: result.created,
+                },
+            )?;
             Ok(0)
         }
         Ok(other) => emit_agent_failure(
@@ -1819,7 +1911,12 @@ async fn agent_fs_rm_command(
     .await
     {
         Ok(ControlResponse::FsRmResult { result }) => {
-            emit_agent_success("fs.rm", result)?;
+            emit_agent_success(
+                "fs.rm",
+                AgentFsRmData {
+                    removed: result.removed,
+                },
+            )?;
             Ok(0)
         }
         Ok(other) => emit_agent_failure(
@@ -1854,7 +1951,12 @@ async fn agent_fs_move_command(
     .await
     {
         Ok(ControlResponse::FsMoveResult { result }) => {
-            emit_agent_success("fs.move", result)?;
+            emit_agent_success(
+                "fs.move",
+                AgentFsMoveData {
+                    overwritten: result.overwritten,
+                },
+            )?;
             Ok(0)
         }
         Ok(other) => emit_agent_failure(
@@ -2832,7 +2934,7 @@ fn agent_schema() -> AgentSchemaData {
             "for transfer.push and transfer.pull, the last positional path is the destination; preceding paths are sources".to_string(),
         ],
         response_envelope: "ok, data?, error?".to_string(),
-        error_fields: "code, message, target?, retryable, details?".to_string(),
+        error_fields: "code, message, target?, retryable?, details?".to_string(),
         operations: vec![
             AgentSchemaOperation {
                 name: "schema".to_string(),
@@ -2869,10 +2971,11 @@ fn agent_schema() -> AgentSchemaData {
                     schema_option("timeout-secs", "u64", false, false),
                 ],
                 positional: vec![schema_positional("command", "string", true, true)],
-                returns:
-                    "target?, cwd?, status, timed_out, stdout, stderr, duration_ms"
+                returns: "target?, status, timed_out?, stdout?, stderr?".to_string(),
+                stream_events: Some(
+                    "stdout{target?,chunk}; stderr{target?,chunk}; completed{target?,status,timed_out?}; failed{error}"
                         .to_string(),
-                stream_events: Some("stdout{target?,chunk}; stderr{target?,chunk}; completed{target?,cwd?,status,timed_out,duration_ms}; failed{error,data?}".to_string()),
+                ),
             },
             AgentSchemaOperation {
                 name: "fs.stat".to_string(),
@@ -2880,8 +2983,7 @@ fn agent_schema() -> AgentSchemaData {
                 target_required: true,
                 options: vec![schema_option("hash", "enum(sha256)", false, false)],
                 positional: vec![schema_positional("path", "string", true, false)],
-                returns: "path, exists, kind?, size?, mode?, mtime_unix_ms?, sha256?"
-                    .to_string(),
+                returns: "exists, kind?, size?, sha256?".to_string(),
                 stream_events: None,
             },
             AgentSchemaOperation {
@@ -2895,7 +2997,7 @@ fn agent_schema() -> AgentSchemaData {
                     schema_option("hash", "enum(sha256)", false, false),
                 ],
                 positional: vec![schema_positional("path", "string", true, false)],
-                returns: "entries[{path,kind,size,mode,mtime_unix_ms?,sha256?}]".to_string(),
+                returns: "entries[{path,kind,size,sha256?}]".to_string(),
                 stream_events: None,
             },
             AgentSchemaOperation {
@@ -2913,7 +3015,7 @@ fn agent_schema() -> AgentSchemaData {
                     schema_option("max-bytes", "u64", false, false),
                 ],
                 positional: vec![schema_positional("path", "string", true, false)],
-                returns: "path, encoding, content, bytes, truncated".to_string(),
+                returns: "content, bytes, truncated?".to_string(),
                 stream_events: None,
             },
             AgentSchemaOperation {
@@ -2937,7 +3039,7 @@ fn agent_schema() -> AgentSchemaData {
                     schema_option("if-sha256", "string", false, false),
                 ],
                 positional: vec![schema_positional("path", "string", true, false)],
-                returns: "path, bytes_written, mode?, sha256?, changed".to_string(),
+                returns: "bytes_written, sha256?, changed?".to_string(),
                 stream_events: None,
             },
             AgentSchemaOperation {
@@ -2949,7 +3051,7 @@ fn agent_schema() -> AgentSchemaData {
                     schema_option("mode", "octal-string", false, false),
                 ],
                 positional: vec![schema_positional("path", "string", true, false)],
-                returns: "path, created".to_string(),
+                returns: "created?".to_string(),
                 stream_events: None,
             },
             AgentSchemaOperation {
@@ -2962,7 +3064,7 @@ fn agent_schema() -> AgentSchemaData {
                     schema_option("if-exists", "bool", false, false),
                 ],
                 positional: vec![schema_positional("path", "string", true, false)],
-                returns: "path, removed".to_string(),
+                returns: "removed?".to_string(),
                 stream_events: None,
             },
             AgentSchemaOperation {
@@ -2974,7 +3076,7 @@ fn agent_schema() -> AgentSchemaData {
                     schema_positional("source", "string", true, false),
                     schema_positional("destination", "string", true, false),
                 ],
-                returns: "source, destination, overwritten".to_string(),
+                returns: "overwritten?".to_string(),
                 stream_events: None,
             },
             AgentSchemaOperation {
@@ -2990,7 +3092,7 @@ fn agent_schema() -> AgentSchemaData {
                     schema_positional("local-sources", "string", true, true),
                     schema_positional("remote-destination", "string", true, false),
                 ],
-                returns: "target?, sources[], destination, entries_written, bytes_written, skipped, verification?, verified, atomic".to_string(),
+                returns: "target?, skipped, verification?, verified?, atomic?".to_string(),
                 stream_events: None,
             },
             AgentSchemaOperation {
@@ -3002,7 +3104,7 @@ fn agent_schema() -> AgentSchemaData {
                     schema_positional("remote-sources", "string", true, true),
                     schema_positional("local-destination", "string", true, false),
                 ],
-                returns: "target?, sources[], destination, entries_received, bytes_received, total_bytes, verification?, verified".to_string(),
+                returns: "target?, verification?, verified?".to_string(),
                 stream_events: None,
             },
         ],
@@ -3060,6 +3162,14 @@ fn schema_positional(
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_empty_json_object(value: &serde_json::Value) -> bool {
+    matches!(value, serde_json::Value::Object(map) if map.is_empty())
+}
+
+fn into_non_empty_string(value: String) -> Option<String> {
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn has_feature(features: &[String], expected: &str) -> bool {
@@ -3249,20 +3359,38 @@ fn map_remote_exec_error(
     map_remote_error("exec", target, code, message, details)
 }
 
+fn exec_failure_details(
+    status: i32,
+    timed_out: bool,
+    stdout: Option<&str>,
+    stderr: Option<&str>,
+) -> serde_json::Value {
+    let mut details = serde_json::Map::new();
+    details.insert("status".to_string(), serde_json::Value::from(status));
+    if timed_out {
+        details.insert("timed_out".to_string(), serde_json::Value::from(true));
+    }
+    if let Some(stdout) = stdout.filter(|value| !value.is_empty()) {
+        details.insert("stdout".to_string(), serde_json::Value::from(stdout));
+    }
+    if let Some(stderr) = stderr.filter(|value| !value.is_empty()) {
+        details.insert("stderr".to_string(), serde_json::Value::from(stderr));
+    }
+    serde_json::Value::Object(details)
+}
+
 fn exec_nonzero_failure(target: String, data: &AgentExecData) -> AgentCommandFailure {
     AgentCommandFailure {
         code: "exec.nonzero".to_string(),
         message: format!("remote command exited with status {}", data.status),
         target: Some(target),
         retryable: false,
-        details: serde_json::json!({
-            "status": data.status,
-            "cwd": data.cwd,
-            "stdout": data.stdout,
-            "stderr": data.stderr,
-            "duration_ms": data.duration_ms,
-            "timed_out": data.timed_out,
-        }),
+        details: exec_failure_details(
+            data.status,
+            data.timed_out,
+            data.stdout.as_deref(),
+            data.stderr.as_deref(),
+        ),
         exit_code: data.status,
     }
 }
@@ -3276,12 +3404,7 @@ fn exec_nonzero_failure_from_completion(
         message: format!("remote command exited with status {}", data.status),
         target: Some(target),
         retryable: false,
-        details: serde_json::json!({
-            "status": data.status,
-            "cwd": data.cwd,
-            "duration_ms": data.duration_ms,
-            "timed_out": data.timed_out,
-        }),
+        details: exec_failure_details(data.status, data.timed_out, None, None),
         exit_code: data.status,
     }
 }
@@ -5113,12 +5236,12 @@ mod tests {
         assert!(exec.positional[0].multiple);
         assert_eq!(
             exec.returns,
-            "target?, cwd?, status, timed_out, stdout, stderr, duration_ms"
+            "target?, status, timed_out?, stdout?, stderr?"
         );
         assert_eq!(
             exec.stream_events.as_deref(),
             Some(
-                "stdout{target?,chunk}; stderr{target?,chunk}; completed{target?,cwd?,status,timed_out,duration_ms}; failed{error,data?}"
+                "stdout{target?,chunk}; stderr{target?,chunk}; completed{target?,status,timed_out?}; failed{error}"
             )
         );
     }
@@ -5148,7 +5271,7 @@ mod tests {
         assert_eq!(schema.response_envelope, "ok, data?, error?");
         assert_eq!(
             schema.error_fields,
-            "code, message, target?, retryable, details?"
+            "code, message, target?, retryable?, details?"
         );
     }
 
@@ -5171,15 +5294,14 @@ mod tests {
                 &"targets[{target,server_id,device_name?,platform?,protocol_version,compatible,supported_operations[]}]"
             )
         );
-        assert_eq!(
-            by_name.get("fs.read"),
-            Some(&"path, encoding, content, bytes, truncated")
-        );
+        assert_eq!(by_name.get("fs.read"), Some(&"content, bytes, truncated?"));
         assert_eq!(
             by_name.get("transfer.push"),
-            Some(
-                &"target?, sources[], destination, entries_written, bytes_written, skipped, verification?, verified, atomic"
-            )
+            Some(&"target?, skipped, verification?, verified?, atomic?")
+        );
+        assert_eq!(
+            by_name.get("transfer.pull"),
+            Some(&"target?, verification?, verified?")
         );
     }
 
@@ -5287,6 +5409,134 @@ mod tests {
         assert_eq!(
             push_positional_names,
             vec!["local-sources", "remote-destination"]
+        );
+    }
+
+    #[test]
+    fn agent_error_body_omits_empty_optional_fields() {
+        let value = serde_json::to_value(AgentErrorBody {
+            code: "exec.nonzero".to_string(),
+            message: "remote command exited with status 7".to_string(),
+            target: None,
+            retryable: false,
+            details: serde_json::json!({}),
+        })
+        .expect("agent error should serialize");
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "code": "exec.nonzero",
+                "message": "remote command exited with status 7",
+            })
+        );
+    }
+
+    #[test]
+    fn agent_exec_data_omits_empty_output_and_default_flags() {
+        let value = serde_json::to_value(AgentExecData {
+            target: None,
+            status: 0,
+            timed_out: false,
+            stdout: None,
+            stderr: None,
+        })
+        .expect("agent exec data should serialize");
+
+        assert_eq!(value, serde_json::json!({ "status": 0 }));
+    }
+
+    #[test]
+    fn agent_payloads_drop_request_echo_fields_and_false_flags() {
+        let stat = serde_json::to_value(AgentFsStatData::from(AgentFsStat {
+            path: "/tmp/example.txt".to_string(),
+            exists: true,
+            kind: Some(FsEntryKind::File),
+            size: Some(7),
+            sha256: None,
+            mode: Some(0o644),
+            mtime_unix_ms: Some(42),
+        }))
+        .expect("agent fs stat should serialize");
+        assert_eq!(
+            stat,
+            serde_json::json!({
+                "exists": true,
+                "kind": "file",
+                "size": 7,
+            })
+        );
+
+        let list = serde_json::to_value(AgentFsListData {
+            entries: vec![AgentFsListEntryData::from(AgentFsEntry {
+                path: "/tmp/example.txt".to_string(),
+                kind: FsEntryKind::File,
+                size: 7,
+                mode: 0o644,
+                mtime_unix_ms: Some(42),
+                sha256: Some("abc".to_string()),
+            })],
+        })
+        .expect("agent fs list should serialize");
+        assert_eq!(
+            list,
+            serde_json::json!({
+                "entries": [
+                    {
+                        "path": "/tmp/example.txt",
+                        "kind": "file",
+                        "size": 7,
+                        "sha256": "abc",
+                    }
+                ]
+            })
+        );
+
+        let read = serde_json::to_value(AgentFsReadData::from(AgentFsReadResult {
+            path: "/tmp/example.txt".to_string(),
+            encoding: ContentEncoding::Utf8,
+            content: "hello".to_string(),
+            bytes: 5,
+            truncated: false,
+        }))
+        .expect("agent fs read should serialize");
+        assert_eq!(
+            read,
+            serde_json::json!({
+                "content": "hello",
+                "bytes": 5,
+            })
+        );
+
+        let push = serde_json::to_value(AgentTransferPushData {
+            target: None,
+            skipped: false,
+            verification: None,
+            verified: false,
+            atomic: false,
+        })
+        .expect("agent transfer push should serialize");
+        assert_eq!(
+            push,
+            serde_json::json!({
+                "skipped": false,
+            })
+        );
+
+        let write = serde_json::to_value(AgentFsWriteData::from(AgentFsWriteResult {
+            path: "/tmp/example.txt".to_string(),
+            bytes_written: 5,
+            mode: Some(0o644),
+            sha256: Some("def".to_string()),
+            changed: false,
+        }))
+        .expect("agent fs write should serialize");
+        assert_eq!(
+            write,
+            serde_json::json!({
+                "bytes_written": 5,
+                "sha256": "def",
+            })
         );
     }
 

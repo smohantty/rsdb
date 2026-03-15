@@ -112,6 +112,8 @@ assert "schema_version" not in obj, obj
 assert "command" not in obj, obj
 assert "data" not in obj, obj
 assert obj["error"]["code"] == expected_code, obj
+if obj["error"].get("details") == {}:
+    raise AssertionError(obj)
 PY
 }
 
@@ -133,8 +135,8 @@ completed_event = next(event for event in events if event["event"] == "completed
 assert "target" not in stdout_event["data"], stdout_event
 assert "target" not in stderr_event["data"], stderr_event
 assert "target" not in completed_event["data"], completed_event
-assert "command" not in completed_event["data"], completed_event
-assert "args" not in completed_event["data"], completed_event
+assert "cwd" not in completed_event["data"], completed_event
+assert "timed_out" not in completed_event["data"], completed_event
 PY
 }
 
@@ -246,7 +248,7 @@ import sys
 
 obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert obj["data"]["response_envelope"] == "ok, data?, error?", obj
-assert obj["data"]["error_fields"] == "code, message, target?, retryable, details?", obj
+assert obj["data"]["error_fields"] == "code, message, target?, retryable?, details?", obj
 names = {operation["name"] for operation in obj["data"]["operations"]}
 assert {
     "schema",
@@ -265,10 +267,11 @@ assert {
 exec_schema = next(
     operation for operation in obj["data"]["operations"] if operation["name"] == "exec"
 )
-assert exec_schema["returns"] == (
-    "target?, cwd?, status, timed_out, stdout, stderr, duration_ms"
-), obj
+assert exec_schema["returns"] == "target?, status, timed_out?, stdout?, stderr?", obj
 assert "stream_events" in exec_schema, obj
+assert exec_schema["stream_events"] == (
+    "stdout{target?,chunk}; stderr{target?,chunk}; completed{target?,status,timed_out?}; failed{error}"
+), obj
 discover_schema = next(
     operation for operation in obj["data"]["operations"] if operation["name"] == "discover"
 )
@@ -318,8 +321,9 @@ obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert obj["data"]["status"] == 0, obj
 assert obj["data"]["stdout"] == "agent-exec-ok\n", obj
 assert "target" not in obj["data"], obj
-assert "command" not in obj["data"], obj
-assert "args" not in obj["data"], obj
+assert "cwd" not in obj["data"], obj
+assert "stderr" not in obj["data"], obj
+assert "timed_out" not in obj["data"], obj
 PY
 
 agent_cmd fs mkdir "$REMOTE_ROOT/cwd" --parents >/dev/null
@@ -331,11 +335,11 @@ import pathlib
 import sys
 
 obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
-assert obj["data"]["cwd"] == sys.argv[2], obj
 assert obj["data"]["stdout"].strip() == sys.argv[2], obj
 assert "target" not in obj["data"], obj
-assert "command" not in obj["data"], obj
-assert "args" not in obj["data"], obj
+assert "cwd" not in obj["data"], obj
+assert "stderr" not in obj["data"], obj
+assert "timed_out" not in obj["data"], obj
 PY
 
 if agent_cmd exec --check -- sh -c 'printf check-failed 1>&2; exit 7' > "$EXEC_CHECK_OUTPUT"; then
@@ -351,6 +355,10 @@ import sys
 obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert obj["error"]["details"]["status"] == 7, obj
 assert "check-failed" in obj["error"]["details"]["stderr"], obj
+assert "cwd" not in obj["error"]["details"], obj
+assert "duration_ms" not in obj["error"]["details"], obj
+assert "timed_out" not in obj["error"]["details"], obj
+assert "retryable" not in obj["error"], obj
 PY
 
 if agent_cmd exec --timeout-secs 1 -- sh -c 'sleep 2' > "$EXEC_TIMEOUT_OUTPUT"; then
@@ -381,7 +389,7 @@ import pathlib
 import sys
 
 obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
-assert obj["data"]["created"] is False, obj
+assert "created" not in obj["data"], obj
 PY
 
 agent_cmd fs write "$REMOTE_ROOT/listing/sub/info.txt" \
@@ -394,6 +402,15 @@ agent_cmd fs write "$REMOTE_ROOT/fs/data.txt" \
     --create-parent \
     --atomic > "$FS_WRITE_OUTPUT"
 assert_json_success "$FS_WRITE_OUTPUT" "fs.write"
+python3 - "$FS_WRITE_OUTPUT" <<'PY'
+import json
+import pathlib
+import sys
+
+obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert "path" not in obj["data"], obj
+assert "mode" not in obj["data"], obj
+PY
 
 agent_cmd fs stat "$REMOTE_ROOT/fs/data.txt" --hash sha256 > "$FS_STAT_OUTPUT"
 assert_json_success "$FS_STAT_OUTPUT" "fs.stat"
@@ -405,6 +422,9 @@ import sys
 obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert obj["data"]["exists"] is True, obj
 assert obj["data"]["sha256"], obj
+assert "path" not in obj["data"], obj
+assert "mode" not in obj["data"], obj
+assert "mtime_unix_ms" not in obj["data"], obj
 print(obj["data"]["sha256"])
 PY
 )"
@@ -421,6 +441,8 @@ entries = {entry["path"]: entry for entry in obj["data"]["entries"]}
 assert any(path.endswith("/listing/.hidden") for path in entries), obj
 assert any(path.endswith("/listing/sub") and entries[path]["kind"] == "directory" for path in entries), obj
 assert any(path.endswith("/listing/sub/info.txt") and entries[path]["sha256"] for path in entries), obj
+assert all("mode" not in entry for entry in entries.values()), obj
+assert all("mtime_unix_ms" not in entry for entry in entries.values()), obj
 PY
 
 agent_cmd fs read "$REMOTE_ROOT/fs/data.txt" > "$FS_READ_OUTPUT"
@@ -432,7 +454,9 @@ import sys
 
 obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert obj["data"]["content"] == "agent-fs-original\n", obj
-assert obj["data"]["truncated"] is False, obj
+assert "path" not in obj["data"], obj
+assert "encoding" not in obj["data"], obj
+assert "truncated" not in obj["data"], obj
 PY
 
 agent_cmd fs read "$REMOTE_ROOT/fs/data.txt" --max-bytes 5 > "$FS_READ_TRUNCATED_OUTPUT"
@@ -446,6 +470,8 @@ obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert obj["data"]["bytes"] == 5, obj
 assert obj["data"]["content"] == "agent", obj
 assert obj["data"]["truncated"] is True, obj
+assert "path" not in obj["data"], obj
+assert "encoding" not in obj["data"], obj
 PY
 
 agent_cmd fs write "$REMOTE_ROOT/fs/binary.bin" \
@@ -464,7 +490,9 @@ import sys
 obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
 expected = pathlib.Path(sys.argv[2]).read_bytes()
 assert base64.b64decode(obj["data"]["content"]) == expected, obj
-assert obj["data"]["truncated"] is False, obj
+assert "path" not in obj["data"], obj
+assert "encoding" not in obj["data"], obj
+assert "truncated" not in obj["data"], obj
 PY
 
 agent_cmd fs write "$REMOTE_ROOT/fs/data.txt" \
@@ -528,7 +556,7 @@ import pathlib
 import sys
 
 obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
-assert obj["data"]["removed"] is False, obj
+assert "removed" not in obj["data"], obj
 PY
 
 agent_cmd fs rm "$REMOTE_ROOT/listing" --recursive > "$FS_RM_TREE_OUTPUT"
@@ -552,6 +580,10 @@ assert obj["data"]["verified"] is True, obj
 assert obj["data"]["atomic"] is True, obj
 assert obj["data"]["skipped"] is False, obj
 assert "target" not in obj["data"], obj
+assert "sources" not in obj["data"], obj
+assert "destination" not in obj["data"], obj
+assert "entries_written" not in obj["data"], obj
+assert "bytes_written" not in obj["data"], obj
 PY
 
 agent_cmd transfer push \
@@ -571,6 +603,10 @@ obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert obj["data"]["verified"] is True, obj
 assert obj["data"]["skipped"] is True, obj
 assert "target" not in obj["data"], obj
+assert "sources" not in obj["data"], obj
+assert "destination" not in obj["data"], obj
+assert "entries_written" not in obj["data"], obj
+assert "bytes_written" not in obj["data"], obj
 PY
 
 agent_cmd transfer pull \
@@ -587,6 +623,11 @@ import sys
 obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert obj["data"]["verified"] is True, obj
 assert "target" not in obj["data"], obj
+assert "sources" not in obj["data"], obj
+assert "destination" not in obj["data"], obj
+assert "entries_received" not in obj["data"], obj
+assert "bytes_received" not in obj["data"], obj
+assert "total_bytes" not in obj["data"], obj
 PY
 
 diff -qr "$LOCAL_ROOT/bundle" "$ROUNDTRIP_DIR/bundle"
