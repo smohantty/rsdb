@@ -328,19 +328,19 @@ struct LocalBatchManifest {
 
 #[derive(Debug, Serialize)]
 struct AgentEnvelope<T> {
-    schema_version: &'static str,
-    command: String,
     ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<AgentErrorBody>,
 }
 
 #[derive(Debug, Serialize)]
 struct AgentEventEnvelope<T> {
-    schema_version: &'static str,
-    command: &'static str,
     event: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<AgentErrorBody>,
 }
 
@@ -430,9 +430,9 @@ struct AgentSchemaPositional {
 
 #[derive(Debug, Serialize)]
 struct AgentExecData {
-    target: String,
-    command: String,
-    args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
     status: i32,
     timed_out: bool,
@@ -443,15 +443,16 @@ struct AgentExecData {
 
 #[derive(Debug, Serialize)]
 struct AgentExecChunkData {
-    target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
     chunk: String,
 }
 
 #[derive(Debug, Serialize)]
 struct AgentExecCompletionData {
-    target: String,
-    command: String,
-    args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
     status: i32,
     timed_out: bool,
@@ -460,12 +461,14 @@ struct AgentExecCompletionData {
 
 #[derive(Debug, Serialize)]
 struct AgentTransferPushData {
-    target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
     sources: Vec<String>,
     destination: String,
     entries_written: u64,
     bytes_written: u64,
     skipped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     verification: Option<String>,
     verified: bool,
     atomic: bool,
@@ -473,12 +476,14 @@ struct AgentTransferPushData {
 
 #[derive(Debug, Serialize)]
 struct AgentTransferPullData {
-    target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
     sources: Vec<String>,
     destination: String,
     entries_received: u64,
     bytes_received: u64,
     total_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     verification: Option<String>,
     verified: bool,
 }
@@ -1091,10 +1096,11 @@ async fn agent_exec_command(
     timeout_secs: Option<u64>,
     command: &[String],
 ) -> Result<i32> {
-    let target = match require_agent_target(target) {
+    let resolved_target = match require_agent_target(target) {
         Ok(target) => target,
         Err(err) => return emit_agent_failure("exec", err),
     };
+    let response_target = agent_response_target(target, &resolved_target);
 
     let (program, args) = match command.split_first() {
         Some((program, args)) => (program.clone(), args.to_vec()),
@@ -1103,7 +1109,7 @@ async fn agent_exec_command(
                 "exec",
                 invalid_request_failure(
                     "exec requires a command after `--`",
-                    Some(target),
+                    Some(resolved_target),
                     serde_json::json!({"field": "command"}),
                 ),
             );
@@ -1111,12 +1117,32 @@ async fn agent_exec_command(
     };
 
     let exit_code = if stream {
-        match run_agent_exec_stream(&target, &program, &args, cwd, timeout_secs, check).await {
+        match run_agent_exec_stream(
+            &resolved_target,
+            response_target.clone(),
+            &program,
+            &args,
+            cwd,
+            timeout_secs,
+            check,
+        )
+        .await
+        {
             Ok(code) => code,
             Err(err) => return emit_agent_failure("exec", err),
         }
     } else {
-        match run_agent_exec(&target, &program, &args, cwd, timeout_secs, check).await {
+        match run_agent_exec(
+            &resolved_target,
+            response_target,
+            &program,
+            &args,
+            cwd,
+            timeout_secs,
+            check,
+        )
+        .await
+        {
             Ok(code) => code,
             Err(err) => return emit_agent_failure("exec", err),
         }
@@ -1207,27 +1233,40 @@ async fn agent_transfer_push_command(
     atomic: bool,
     if_changed: bool,
 ) -> Result<i32> {
-    let target = match require_agent_target(target) {
+    let resolved_target = match require_agent_target(target) {
         Ok(target) => target,
         Err(err) => return emit_agent_failure("transfer.push", err),
     };
+    let response_target = agent_response_target(target, &resolved_target);
     let (sources, destination) = match split_sources_and_destination(paths, "agent transfer push") {
         Ok(parts) => parts,
         Err(err) => {
             return emit_agent_failure(
                 "transfer.push",
-                invalid_request_failure(err.to_string(), Some(target), serde_json::json!({})),
+                invalid_request_failure(
+                    err.to_string(),
+                    Some(resolved_target),
+                    serde_json::json!({}),
+                ),
             );
         }
     };
 
-    match run_agent_transfer_push(&target, &sources, &destination, verify, atomic, if_changed).await
+    match run_agent_transfer_push(
+        &resolved_target,
+        &sources,
+        &destination,
+        verify,
+        atomic,
+        if_changed,
+    )
+    .await
     {
         Ok(summary) => {
             emit_agent_success(
                 "transfer.push",
                 AgentTransferPushData {
-                    target,
+                    target: response_target,
                     sources,
                     destination,
                     entries_written: summary.entries_written,
@@ -1249,26 +1288,31 @@ async fn agent_transfer_pull_command(
     paths: &[String],
     verify: Option<CliTransferVerifyMode>,
 ) -> Result<i32> {
-    let target = match require_agent_target(target) {
+    let resolved_target = match require_agent_target(target) {
         Ok(target) => target,
         Err(err) => return emit_agent_failure("transfer.pull", err),
     };
+    let response_target = agent_response_target(target, &resolved_target);
     let (sources, destination) = match split_sources_and_destination(paths, "agent transfer pull") {
         Ok(parts) => parts,
         Err(err) => {
             return emit_agent_failure(
                 "transfer.pull",
-                invalid_request_failure(err.to_string(), Some(target), serde_json::json!({})),
+                invalid_request_failure(
+                    err.to_string(),
+                    Some(resolved_target),
+                    serde_json::json!({}),
+                ),
             );
         }
     };
 
-    match run_agent_transfer_pull(&target, &sources, &destination, verify).await {
+    match run_agent_transfer_pull(&resolved_target, &sources, &destination, verify).await {
         Ok(summary) => {
             emit_agent_success(
                 "transfer.pull",
                 AgentTransferPullData {
-                    target,
+                    target: response_target,
                     sources,
                     destination,
                     entries_received: summary.entries_received,
@@ -1286,6 +1330,7 @@ async fn agent_transfer_pull_command(
 
 async fn run_agent_exec(
     target: &str,
+    response_target: Option<String>,
     program: &str,
     args: &[String],
     cwd: Option<&str>,
@@ -1314,9 +1359,7 @@ async fn run_agent_exec(
             timed_out,
         } => {
             let data = AgentExecData {
-                target: target.to_string(),
-                command: program.to_string(),
-                args: args.to_vec(),
+                target: response_target,
                 cwd: cwd.map(ToOwned::to_owned),
                 status,
                 timed_out,
@@ -1350,6 +1393,7 @@ async fn run_agent_exec(
 
 async fn run_agent_exec_stream(
     target: &str,
+    response_target: Option<String>,
     program: &str,
     args: &[String],
     cwd: Option<&str>,
@@ -1422,7 +1466,7 @@ async fn run_agent_exec_stream(
                             "exec",
                             event,
                             Some(AgentExecChunkData {
-                                target: target.to_string(),
+                                target: response_target.clone(),
                                 chunk: String::from_utf8_lossy(&chunk.payload).into_owned(),
                             }),
                         )
@@ -1456,7 +1500,7 @@ async fn run_agent_exec_stream(
                                 "exec",
                                 "stdout",
                                 Some(AgentExecChunkData {
-                                    target: target.to_string(),
+                                    target: response_target.clone(),
                                     chunk: stdout,
                                 }),
                             )
@@ -1467,7 +1511,7 @@ async fn run_agent_exec_stream(
                                 "exec",
                                 "stderr",
                                 Some(AgentExecChunkData {
-                                    target: target.to_string(),
+                                    target: response_target.clone(),
                                     chunk: stderr,
                                 }),
                             )
@@ -1475,9 +1519,7 @@ async fn run_agent_exec_stream(
                         }
 
                         let data = AgentExecCompletionData {
-                            target: target.to_string(),
-                            command: program.to_string(),
-                            args: args.to_vec(),
+                            target: response_target.clone(),
                             cwd: cwd.map(ToOwned::to_owned),
                             status,
                             timed_out,
@@ -2629,6 +2671,13 @@ fn require_agent_target(target: Option<&str>) -> AgentResult<String> {
     }
 }
 
+fn agent_response_target(target_arg: Option<&str>, resolved_target: &str) -> Option<String> {
+    if target_arg.is_none() {
+        return Some(resolved_target.to_string());
+    }
+    None
+}
+
 async fn agent_request(
     command: &str,
     target: &str,
@@ -2782,7 +2831,7 @@ fn agent_schema() -> AgentSchemaData {
             "for exec, place -- before the remote command argv".to_string(),
             "for transfer.push and transfer.pull, the last positional path is the destination; preceding paths are sources".to_string(),
         ],
-        response_envelope: "schema_version, command, ok, data?, error?".to_string(),
+        response_envelope: "ok, data?, error?".to_string(),
         error_fields: "code, message, target?, retryable, details?".to_string(),
         operations: vec![
             AgentSchemaOperation {
@@ -2821,9 +2870,9 @@ fn agent_schema() -> AgentSchemaData {
                 ],
                 positional: vec![schema_positional("command", "string", true, true)],
                 returns:
-                    "target, command, args[], cwd?, status, timed_out, stdout, stderr, duration_ms"
+                    "target?, cwd?, status, timed_out, stdout, stderr, duration_ms"
                         .to_string(),
-                stream_events: Some("stdout{target,chunk}; stderr{target,chunk}; completed{target,command,args[],cwd?,status,timed_out,duration_ms}; failed{error,data?}".to_string()),
+                stream_events: Some("stdout{target?,chunk}; stderr{target?,chunk}; completed{target?,cwd?,status,timed_out,duration_ms}; failed{error,data?}".to_string()),
             },
             AgentSchemaOperation {
                 name: "fs.stat".to_string(),
@@ -2941,7 +2990,7 @@ fn agent_schema() -> AgentSchemaData {
                     schema_positional("local-sources", "string", true, true),
                     schema_positional("remote-destination", "string", true, false),
                 ],
-                returns: "target, sources[], destination, entries_written, bytes_written, skipped, verification?, verified, atomic".to_string(),
+                returns: "target?, sources[], destination, entries_written, bytes_written, skipped, verification?, verified, atomic".to_string(),
                 stream_events: None,
             },
             AgentSchemaOperation {
@@ -2953,7 +3002,7 @@ fn agent_schema() -> AgentSchemaData {
                     schema_positional("remote-sources", "string", true, true),
                     schema_positional("local-destination", "string", true, false),
                 ],
-                returns: "target, sources[], destination, entries_received, bytes_received, total_bytes, verification?, verified".to_string(),
+                returns: "target?, sources[], destination, entries_received, bytes_received, total_bytes, verification?, verified".to_string(),
                 stream_events: None,
             },
         ],
@@ -3021,23 +3070,19 @@ fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-fn emit_agent_success<T>(command: &str, data: T) -> Result<()>
+fn emit_agent_success<T>(_command: &str, data: T) -> Result<()>
 where
     T: Serialize,
 {
     write_json_stdout(&AgentEnvelope {
-        schema_version: "agent.v1",
-        command: command.to_string(),
         ok: true,
         data: Some(data),
         error: None,
     })
 }
 
-fn emit_agent_failure(command: &str, error: AgentCommandFailure) -> Result<i32> {
+fn emit_agent_failure(_command: &str, error: AgentCommandFailure) -> Result<i32> {
     write_json_stdout(&AgentEnvelope::<serde_json::Value> {
-        schema_version: "agent.v1",
-        command: command.to_string(),
         ok: false,
         data: None,
         error: Some(AgentErrorBody {
@@ -3051,13 +3096,11 @@ fn emit_agent_failure(command: &str, error: AgentCommandFailure) -> Result<i32> 
     Ok(error.exit_code)
 }
 
-fn emit_agent_event<T>(command: &'static str, event: &'static str, data: Option<T>) -> Result<()>
+fn emit_agent_event<T>(_command: &'static str, event: &'static str, data: Option<T>) -> Result<()>
 where
     T: Serialize,
 {
     write_json_stdout(&AgentEventEnvelope {
-        schema_version: "agent.v1",
-        command,
         event,
         data,
         error: None,
@@ -3065,7 +3108,7 @@ where
 }
 
 fn emit_agent_event_failure<T>(
-    command: &'static str,
+    _command: &'static str,
     event: &'static str,
     error: AgentCommandFailure,
     data: Option<T>,
@@ -3074,8 +3117,6 @@ where
     T: Serialize,
 {
     write_json_stdout(&AgentEventEnvelope {
-        schema_version: "agent.v1",
-        command,
         event,
         data,
         error: Some(AgentErrorBody {
@@ -5072,12 +5113,12 @@ mod tests {
         assert!(exec.positional[0].multiple);
         assert_eq!(
             exec.returns,
-            "target, command, args[], cwd?, status, timed_out, stdout, stderr, duration_ms"
+            "target?, cwd?, status, timed_out, stdout, stderr, duration_ms"
         );
         assert_eq!(
             exec.stream_events.as_deref(),
             Some(
-                "stdout{target,chunk}; stderr{target,chunk}; completed{target,command,args[],cwd?,status,timed_out,duration_ms}; failed{error,data?}"
+                "stdout{target?,chunk}; stderr{target?,chunk}; completed{target?,cwd?,status,timed_out,duration_ms}; failed{error,data?}"
             )
         );
     }
@@ -5104,10 +5145,7 @@ mod tests {
         let schema = agent_schema();
 
         assert_eq!(schema.command_prefix, vec!["rsdb", "agent"]);
-        assert_eq!(
-            schema.response_envelope,
-            "schema_version, command, ok, data?, error?"
-        );
+        assert_eq!(schema.response_envelope, "ok, data?, error?");
         assert_eq!(
             schema.error_fields,
             "code, message, target?, retryable, details?"
@@ -5140,7 +5178,7 @@ mod tests {
         assert_eq!(
             by_name.get("transfer.push"),
             Some(
-                &"target, sources[], destination, entries_written, bytes_written, skipped, verification?, verified, atomic"
+                &"target?, sources[], destination, entries_written, bytes_written, skipped, verification?, verified, atomic"
             )
         );
     }

@@ -90,12 +90,11 @@ import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
-expected_command = sys.argv[2]
 obj = json.loads(path.read_text())
-assert obj["schema_version"] == "agent.v1", obj
-assert obj["command"] == expected_command, obj
 assert obj["ok"] is True, obj
-assert obj["error"] is None, obj
+assert "schema_version" not in obj, obj
+assert "command" not in obj, obj
+assert "error" not in obj, obj
 PY
 }
 
@@ -106,12 +105,12 @@ import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
-expected_command = sys.argv[2]
 expected_code = sys.argv[3]
 obj = json.loads(path.read_text())
-assert obj["schema_version"] == "agent.v1", obj
-assert obj["command"] == expected_command, obj
 assert obj["ok"] is False, obj
+assert "schema_version" not in obj, obj
+assert "command" not in obj, obj
+assert "data" not in obj, obj
 assert obj["error"]["code"] == expected_code, obj
 PY
 }
@@ -123,9 +122,19 @@ import pathlib
 import sys
 
 events = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if line.strip()]
-assert any(event["event"] == "stdout" and event["data"]["chunk"] == "out" for event in events), events
-assert any(event["event"] == "stderr" and event["data"]["chunk"] == "err" for event in events), events
-assert any(event["event"] == "completed" and event["data"]["status"] == 0 for event in events), events
+for event in events:
+    assert "schema_version" not in event, events
+    assert "command" not in event, events
+
+stdout_event = next(event for event in events if event["event"] == "stdout" and event["data"]["chunk"] == "out")
+stderr_event = next(event for event in events if event["event"] == "stderr" and event["data"]["chunk"] == "err")
+completed_event = next(event for event in events if event["event"] == "completed" and event["data"]["status"] == 0)
+
+assert "target" not in stdout_event["data"], stdout_event
+assert "target" not in stderr_event["data"], stderr_event
+assert "target" not in completed_event["data"], completed_event
+assert "command" not in completed_event["data"], completed_event
+assert "args" not in completed_event["data"], completed_event
 PY
 }
 
@@ -236,7 +245,7 @@ import pathlib
 import sys
 
 obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
-assert obj["data"]["response_envelope"] == "schema_version, command, ok, data?, error?", obj
+assert obj["data"]["response_envelope"] == "ok, data?, error?", obj
 assert obj["data"]["error_fields"] == "code, message, target?, retryable, details?", obj
 names = {operation["name"] for operation in obj["data"]["operations"]}
 assert {
@@ -257,7 +266,7 @@ exec_schema = next(
     operation for operation in obj["data"]["operations"] if operation["name"] == "exec"
 )
 assert exec_schema["returns"] == (
-    "target, command, args[], cwd?, status, timed_out, stdout, stderr, duration_ms"
+    "target?, cwd?, status, timed_out, stdout, stderr, duration_ms"
 ), obj
 assert "stream_events" in exec_schema, obj
 discover_schema = next(
@@ -308,6 +317,9 @@ import sys
 obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert obj["data"]["status"] == 0, obj
 assert obj["data"]["stdout"] == "agent-exec-ok\n", obj
+assert "target" not in obj["data"], obj
+assert "command" not in obj["data"], obj
+assert "args" not in obj["data"], obj
 PY
 
 agent_cmd fs mkdir "$REMOTE_ROOT/cwd" --parents >/dev/null
@@ -321,6 +333,9 @@ import sys
 obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert obj["data"]["cwd"] == sys.argv[2], obj
 assert obj["data"]["stdout"].strip() == sys.argv[2], obj
+assert "target" not in obj["data"], obj
+assert "command" not in obj["data"], obj
+assert "args" not in obj["data"], obj
 PY
 
 if agent_cmd exec --check -- sh -c 'printf check-failed 1>&2; exit 7' > "$EXEC_CHECK_OUTPUT"; then
@@ -536,6 +551,7 @@ obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert obj["data"]["verified"] is True, obj
 assert obj["data"]["atomic"] is True, obj
 assert obj["data"]["skipped"] is False, obj
+assert "target" not in obj["data"], obj
 PY
 
 agent_cmd transfer push \
@@ -554,6 +570,7 @@ import sys
 obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert obj["data"]["verified"] is True, obj
 assert obj["data"]["skipped"] is True, obj
+assert "target" not in obj["data"], obj
 PY
 
 agent_cmd transfer pull \
@@ -569,6 +586,7 @@ import sys
 
 obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert obj["data"]["verified"] is True, obj
+assert "target" not in obj["data"], obj
 PY
 
 diff -qr "$LOCAL_ROOT/bundle" "$ROUNDTRIP_DIR/bundle"
