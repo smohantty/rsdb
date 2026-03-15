@@ -32,11 +32,7 @@ sudo cargo install --path crates/rsdb-cli --root /usr/local --force
 
 ## Install the daemon from the release page
 
-Open the latest release:
-
-```text
-https://github.com/smohantty/rsdb/releases/latest
-```
+Open the latest release page for this repository.
 
 Download the RPM that matches your device:
 
