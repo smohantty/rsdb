@@ -82,7 +82,7 @@ enum Commands {
     Discover {
         #[arg(long, default_value = "255.255.255.255")]
         probe_addr: String,
-        #[arg(long, default_value_t = 1000)]
+        #[arg(long, default_value_t = 3000)]
         timeout_ms: u64,
     },
     /// Check whether a target daemon responds.
@@ -150,7 +150,7 @@ enum AgentCommands {
     Discover {
         #[arg(long, default_value = "255.255.255.255")]
         probe_addr: String,
-        #[arg(long, default_value_t = 1000)]
+        #[arg(long, default_value_t = 3000)]
         timeout_ms: u64,
     },
     /// Execute one direct remote process with JSON output.
