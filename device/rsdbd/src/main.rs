@@ -95,6 +95,26 @@ struct BatchManifest {
     total_bytes: u64,
 }
 
+struct ExecRequest<'a> {
+    command: &'a str,
+    args: &'a [String],
+    cwd: Option<&'a str>,
+    timeout_secs: Option<u64>,
+    stream_output: bool,
+}
+
+struct ShellRequest {
+    command: Option<String>,
+    args: Vec<String>,
+    pty: Option<ShellPtyRequest>,
+}
+
+struct ShellPtyRequest {
+    term: Option<String>,
+    rows: Option<u16>,
+    cols: Option<u16>,
+}
+
 #[derive(Debug)]
 struct FsPreconditionError(String);
 
@@ -361,17 +381,14 @@ where
             timeout_secs,
             stream: stream_output,
         } => {
-            return handle_exec_request(
-                stream,
-                request_id,
-                &command,
-                &args,
-                cwd.as_deref(),
+            let exec_request = ExecRequest {
+                command: &command,
+                args: &args,
+                cwd: cwd.as_deref(),
                 timeout_secs,
                 stream_output,
-                state,
-            )
-            .await;
+            };
+            return handle_exec_request(stream, request_id, exec_request, state).await;
         }
         ControlRequest::FsStat { path, hash } => {
             if let Err(err) = handle_fs_stat(&mut stream, request_id, &path, hash).await {
@@ -516,13 +533,16 @@ where
             rows,
             cols,
         } => {
-            if let Err(err) = handle_shell(
-                stream, request_id, command, args, pty, term, rows, cols, state,
-            )
-            .await
-            {
-                return Err(err);
-            }
+            let shell_request = ShellRequest {
+                command,
+                args,
+                pty: if pty {
+                    Some(ShellPtyRequest { term, rows, cols })
+                } else {
+                    None
+                },
+            };
+            handle_shell(stream, request_id, shell_request, state).await?;
         }
     }
     Ok(())
@@ -563,24 +583,20 @@ fn capabilities() -> CapabilitySet {
 async fn handle_exec_request<S>(
     mut stream: S,
     request_id: u32,
-    command: &str,
-    args: &[String],
-    cwd: Option<&str>,
-    timeout_secs: Option<u64>,
-    stream_output: bool,
+    request: ExecRequest<'_>,
     state: &ServerState,
 ) -> Result<()>
 where
     S: ConnectionStream,
 {
-    if stream_output {
+    if request.stream_output {
         return match stream_command_output(
             &mut stream,
             request_id,
-            command,
-            args,
-            cwd,
-            timeout_secs,
+            request.command,
+            request.args,
+            request.cwd,
+            request.timeout_secs,
             state,
         )
         .await
@@ -597,7 +613,15 @@ where
         };
     }
 
-    let response = match execute_command(command, args, cwd, timeout_secs, state).await {
+    let response = match execute_command(
+        request.command,
+        request.args,
+        request.cwd,
+        request.timeout_secs,
+        state,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(err) => ControlResponse::Error {
             code: ErrorCode::ExecFailed,
@@ -922,12 +946,13 @@ async fn handle_fs_write(
         .into());
     }
 
-    if let Some(parent) = requested.parent() {
-        if !parent.as_os_str().is_empty() && create_parent {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+    if let Some(parent) = requested.parent()
+        && !parent.as_os_str().is_empty()
+        && create_parent
+    {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
     let existing_metadata = match std::fs::symlink_metadata(&requested) {
@@ -1696,12 +1721,12 @@ where
                 }
             }
             TransferEntryKind::File => {
-                if let Some(parent) = output_path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        tokio::fs::create_dir_all(parent).await.with_context(|| {
-                            format!("failed to create remote directory {}", parent.display())
-                        })?;
-                    }
+                if let Some(parent) = output_path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    tokio::fs::create_dir_all(parent).await.with_context(|| {
+                        format!("failed to create remote directory {}", parent.display())
+                    })?;
                 }
 
                 let mut options = OpenOptions::new();
@@ -2200,19 +2225,15 @@ fn glob_match_options() -> MatchOptions {
 async fn handle_shell<S>(
     stream: S,
     request_id: u32,
-    command: Option<String>,
-    args: Vec<String>,
-    pty: bool,
-    term: Option<String>,
-    rows: Option<u16>,
-    cols: Option<u16>,
+    request: ShellRequest,
     state: &ServerState,
 ) -> Result<()>
 where
     S: ConnectionStream + 'static,
 {
-    if pty {
-        return handle_pty_shell(stream, request_id, command, args, term, rows, cols, state).await;
+    let ShellRequest { command, args, pty } = request;
+    if let Some(pty) = pty {
+        return handle_pty_shell(stream, request_id, command, args, pty, state).await;
     }
 
     handle_pipe_shell(stream, request_id, command, args, state).await
@@ -2372,14 +2393,13 @@ async fn handle_pty_shell<S>(
     request_id: u32,
     command: Option<String>,
     args: Vec<String>,
-    term: Option<String>,
-    rows: Option<u16>,
-    cols: Option<u16>,
+    pty: ShellPtyRequest,
     state: &ServerState,
 ) -> Result<()>
 where
     S: ConnectionStream + 'static,
 {
+    let ShellPtyRequest { term, rows, cols } = pty;
     let (display_command, mut child, controller) = spawn_pty_shell(
         command,
         args,
@@ -2436,11 +2456,11 @@ where
                     Some(Ok(frame)) => {
                         let chunk = decode_stream_frame(frame)?;
                         expect_stream_chunk(&chunk, request_id, StreamChannel::Stdin)?;
-                        if !chunk.payload.is_empty() {
-                            if let Some(tx) = &pty_input_tx {
-                                tx.send(PtyInput::Data(chunk.payload)).await
-                                    .context("failed to forward PTY stdin chunk")?;
-                            }
+                        if !chunk.payload.is_empty()
+                            && let Some(tx) = &pty_input_tx
+                        {
+                            tx.send(PtyInput::Data(chunk.payload)).await
+                                .context("failed to forward PTY stdin chunk")?;
                         }
                         if chunk.eof {
                             if let Some(tx) = pty_input_tx.take() {

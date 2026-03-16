@@ -3855,7 +3855,7 @@ async fn execute_push_manifest(
     remote_path: &str,
     progress: Option<&mut TransferProgress>,
 ) -> Result<PushSummary> {
-    let mut stream = open_connection(&addr).await?;
+    let mut stream = open_connection(addr).await?;
     write_json_frame(
         &mut stream,
         FrameKind::Request,
@@ -3925,7 +3925,7 @@ async fn execute_pull_with_progress(
     local_destination: &str,
     mut progress: Option<&mut TransferProgress>,
 ) -> Result<PullSummary> {
-    let mut stream = open_connection(&addr).await?;
+    let mut stream = open_connection(addr).await?;
     write_json_frame(
         &mut stream,
         FrameKind::Request,
@@ -4123,7 +4123,7 @@ fn build_local_batch_manifest(source_specs: &[String]) -> Result<LocalBatchManif
     let mut total_bytes = 0_u64;
 
     for source in &sources {
-        let metadata = fs::symlink_metadata(&source)
+        let metadata = fs::symlink_metadata(source)
             .with_context(|| format!("failed to stat local path {}", source.display()))?;
         if metadata.file_type().is_symlink() {
             bail!(
@@ -4142,14 +4142,14 @@ fn build_local_batch_manifest(source_specs: &[String]) -> Result<LocalBatchManif
 
         let root_index = roots.len() as u32;
         roots.push(TransferRoot {
-            source_name: transfer_source_name(&source)?,
+            source_name: transfer_source_name(source)?,
             kind: kind.clone(),
             mode: local_file_mode(&metadata),
         });
 
         append_local_manifest_entry(
             root_index,
-            &source,
+            source,
             Path::new(""),
             &metadata,
             &mut entries,
@@ -5063,12 +5063,12 @@ where
 }
 
 async fn create_local_output_file(path: &Path, mode: u32) -> Result<File> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await.with_context(|| {
-                format!("failed to create local directory {}", parent.display())
-            })?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create local directory {}", parent.display()))?;
     }
 
     let mut options = OpenOptions::new();
@@ -5168,7 +5168,7 @@ fn write_registry(path: &Path, registry: &Registry) -> Result<()> {
     fs::create_dir_all(parent)
         .with_context(|| format!("failed to create config dir {}", parent.display()))?;
     let contents = serde_json::to_string_pretty(&registry)?;
-    fs::write(&path, contents)
+    fs::write(path, contents)
         .with_context(|| format!("failed to write registry file {}", path.display()))?;
     Ok(())
 }
