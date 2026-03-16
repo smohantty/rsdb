@@ -22,9 +22,9 @@ use rsdb_proto::{
     ContentEncoding, ControlRequest, ControlResponse, DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest,
     DiscoveryResponse, FrameKind, FsEntryKind, HEADER_LEN, HashAlgorithm,
     MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION, StreamChannel, TransferEntry, TransferEntryKind,
-    TransferRoot, decode_discovery_message, decode_json, decode_stream_frame,
-    encode_discovery_message, read_frame, read_stream_frame_into, write_json_frame,
-    write_stream_frame,
+    TransferRoot, decode_discovery_message, decode_json, decode_json_payload, decode_stream_frame,
+    decode_stream_frame_header, encode_discovery_message, read_frame, read_frame_into,
+    read_stream_frame_into, write_json_frame, write_stream_frame,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1612,9 +1612,10 @@ async fn run_agent_exec_stream(
     .await
     .map_err(|err| internal_agent_failure(anyhow!("failed to send exec request: {err}")))?;
 
+    let mut frame_payload = Vec::with_capacity(DEFAULT_STREAM_CHUNK_SIZE);
     loop {
-        let frame = match read_frame(&mut stream).await {
-            Ok(frame) => frame,
+        let header = match read_frame_into(&mut stream, &mut frame_payload).await {
+            Ok(header) => header,
             Err(err) => {
                 let failure =
                     map_transport_error("exec", Some(target.to_string()), &anyhow!("{err}"));
@@ -1623,9 +1624,9 @@ async fn run_agent_exec_stream(
                 return Ok(1);
             }
         };
-        match frame.header.kind {
+        match header.kind {
             FrameKind::Stream => {
-                let chunk = match decode_stream_frame(frame) {
+                let chunk = match decode_stream_frame_header(&header) {
                     Ok(chunk) => chunk,
                     Err(err) => {
                         emit_agent_event_failure::<serde_json::Value>(
@@ -1653,34 +1654,35 @@ async fn run_agent_exec_stream(
                     StreamChannel::Stderr => Some("stderr"),
                     _ => None,
                 };
-                if let Some(event) = event {
-                    if !chunk.payload.is_empty() {
-                        emit_agent_event(
-                            "exec",
-                            event,
-                            Some(AgentExecChunkData {
-                                target: response_target.clone(),
-                                chunk: String::from_utf8_lossy(&chunk.payload).into_owned(),
-                            }),
-                        )
-                        .map_err(internal_agent_failure)?;
-                    }
+                if let Some(event) = event
+                    && !frame_payload.is_empty()
+                {
+                    emit_agent_event(
+                        "exec",
+                        event,
+                        Some(AgentExecChunkData {
+                            target: response_target.clone(),
+                            chunk: String::from_utf8_lossy(&frame_payload).into_owned(),
+                        }),
+                    )
+                    .map_err(internal_agent_failure)?;
                 }
             }
             FrameKind::Response => {
-                let response: ControlResponse = match decode_json(&frame, FrameKind::Response) {
-                    Ok(response) => response,
-                    Err(err) => {
-                        emit_agent_event_failure::<serde_json::Value>(
-                            "exec",
-                            "failed",
-                            internal_agent_failure(anyhow!("invalid response frame: {err}")),
-                            None,
-                        )
-                        .map_err(internal_agent_failure)?;
-                        return Ok(1);
-                    }
-                };
+                let response: ControlResponse =
+                    match decode_json_payload(&header, &frame_payload, FrameKind::Response) {
+                        Ok(response) => response,
+                        Err(err) => {
+                            emit_agent_event_failure::<serde_json::Value>(
+                                "exec",
+                                "failed",
+                                internal_agent_failure(anyhow!("invalid response frame: {err}")),
+                                None,
+                            )
+                            .map_err(internal_agent_failure)?;
+                            return Ok(1);
+                        }
+                    };
                 match response {
                     ControlResponse::ExecResult {
                         status,

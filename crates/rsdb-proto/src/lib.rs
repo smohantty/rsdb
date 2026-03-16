@@ -520,12 +520,25 @@ pub async fn read_frame<R>(reader: &mut R) -> Result<Frame, ProtocolError>
 where
     R: AsyncRead + Unpin,
 {
+    let mut payload = Vec::new();
+    let header = read_frame_into(reader, &mut payload).await?;
+    Ok(Frame { header, payload })
+}
+
+pub async fn read_frame_into<R>(
+    reader: &mut R,
+    payload: &mut Vec<u8>,
+) -> Result<FrameHeader, ProtocolError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut header_bytes = [0_u8; HEADER_LEN];
     reader.read_exact(&mut header_bytes).await?;
     let header = FrameHeader::decode(header_bytes)?;
-    let mut payload = vec![0_u8; header.payload_len as usize];
-    reader.read_exact(&mut payload).await?;
-    Ok(Frame { header, payload })
+    payload.resize(header.payload_len as usize, 0);
+    reader.read_exact(payload).await?;
+
+    Ok(header)
 }
 
 pub async fn read_stream_frame_into<R>(
@@ -535,24 +548,8 @@ pub async fn read_stream_frame_into<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut header_bytes = [0_u8; HEADER_LEN];
-    reader.read_exact(&mut header_bytes).await?;
-    let header = FrameHeader::decode(header_bytes)?;
-    if header.kind != FrameKind::Stream {
-        return Err(ProtocolError::UnexpectedFrameKind {
-            expected: FrameKind::Stream,
-            actual: header.kind,
-        });
-    }
-
-    payload.resize(header.payload_len as usize, 0);
-    reader.read_exact(payload).await?;
-
-    Ok(StreamFrameHeader {
-        request_id: header.request_id,
-        channel: StreamChannel::from_u32(header.flags & STREAM_CHANNEL_MASK)?,
-        eof: header.flags & STREAM_EOF_FLAG != 0,
-    })
+    let header = read_frame_into(reader, payload).await?;
+    decode_stream_frame_header(&header)
 }
 
 pub async fn write_json_frame<W, T>(
@@ -636,30 +633,50 @@ pub fn decode_json<T>(frame: &Frame, expected_kind: FrameKind) -> Result<T, Prot
 where
     T: DeserializeOwned,
 {
-    if frame.header.kind != expected_kind {
+    decode_json_payload(&frame.header, &frame.payload, expected_kind)
+}
+
+pub fn decode_json_payload<T>(
+    header: &FrameHeader,
+    payload: &[u8],
+    expected_kind: FrameKind,
+) -> Result<T, ProtocolError>
+where
+    T: DeserializeOwned,
+{
+    if header.kind != expected_kind {
         return Err(ProtocolError::UnexpectedFrameKind {
             expected: expected_kind,
-            actual: frame.header.kind,
+            actual: header.kind,
         });
     }
 
-    Ok(serde_json::from_slice(&frame.payload)?)
+    Ok(serde_json::from_slice(payload)?)
+}
+
+pub fn decode_stream_frame_header(
+    header: &FrameHeader,
+) -> Result<StreamFrameHeader, ProtocolError> {
+    if header.kind != FrameKind::Stream {
+        return Err(ProtocolError::UnexpectedFrameKind {
+            expected: FrameKind::Stream,
+            actual: header.kind,
+        });
+    }
+
+    Ok(StreamFrameHeader {
+        request_id: header.request_id,
+        channel: StreamChannel::from_u32(header.flags & STREAM_CHANNEL_MASK)?,
+        eof: header.flags & STREAM_EOF_FLAG != 0,
+    })
 }
 
 pub fn decode_stream_frame(frame: Frame) -> Result<StreamFrame, ProtocolError> {
-    if frame.header.kind != FrameKind::Stream {
-        return Err(ProtocolError::UnexpectedFrameKind {
-            expected: FrameKind::Stream,
-            actual: frame.header.kind,
-        });
-    }
-
-    let channel = StreamChannel::from_u32(frame.header.flags & STREAM_CHANNEL_MASK)?;
-    let eof = frame.header.flags & STREAM_EOF_FLAG != 0;
+    let header = decode_stream_frame_header(&frame.header)?;
     Ok(StreamFrame {
-        request_id: frame.header.request_id,
-        channel,
-        eof,
+        request_id: header.request_id,
+        channel: header.channel,
+        eof: header.eof,
         payload: frame.payload,
     })
 }
@@ -728,6 +745,30 @@ mod tests {
         assert_eq!(decoded.channel, StreamChannel::File);
         assert!(decoded.eof);
         assert_eq!(decoded.payload, b"chunk-data");
+    }
+
+    #[tokio::test]
+    async fn read_frame_into_reuses_existing_payload_capacity() {
+        let (mut client, mut server) = duplex(1024);
+        let expected = b"chunk-data".to_vec();
+
+        let send = tokio::spawn(async move {
+            write_stream_frame(&mut client, 5, StreamChannel::File, false, &expected)
+                .await
+                .expect("stream frame should write");
+        });
+
+        let mut payload = Vec::with_capacity(256);
+        let header = read_frame_into(&mut server, &mut payload)
+            .await
+            .expect("frame should read");
+        send.await.expect("writer task should finish");
+        let decoded = decode_stream_frame_header(&header).expect("header should decode");
+        assert_eq!(decoded.request_id, 5);
+        assert_eq!(decoded.channel, StreamChannel::File);
+        assert!(!decoded.eof);
+        assert_eq!(payload, b"chunk-data");
+        assert!(payload.capacity() >= 256);
     }
 
     #[tokio::test]
