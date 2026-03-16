@@ -509,6 +509,112 @@ struct PullSummary {
     entries: Vec<TransferEntry>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum TransferProgressKind {
+    Push,
+    Pull,
+}
+
+impl TransferProgressKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Push => "pushing",
+            Self::Pull => "pulling",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TransferProgress {
+    kind: TransferProgressKind,
+    total_bytes: u64,
+    bytes_done: u64,
+    started: Instant,
+    last_draw: Option<Instant>,
+    enabled: bool,
+    dirty_line: bool,
+}
+
+impl TransferProgress {
+    fn new(kind: TransferProgressKind) -> Self {
+        Self {
+            kind,
+            total_bytes: 0,
+            bytes_done: 0,
+            started: Instant::now(),
+            last_draw: None,
+            enabled: std::io::stderr().is_terminal(),
+            dirty_line: false,
+        }
+    }
+
+    fn set_total_bytes(&mut self, total_bytes: u64) {
+        self.total_bytes = total_bytes;
+    }
+
+    fn advance(&mut self, delta: u64) {
+        self.bytes_done = self.bytes_done.saturating_add(delta);
+        self.draw();
+    }
+
+    fn finish(&mut self) {
+        if !self.enabled || !self.dirty_line {
+            return;
+        }
+
+        let mut stderr = std::io::stderr().lock();
+        if write!(stderr, "\r\x1b[2K")
+            .and_then(|_| stderr.flush())
+            .is_err()
+        {
+            self.enabled = false;
+            return;
+        }
+
+        self.dirty_line = false;
+    }
+
+    fn draw(&mut self) {
+        if !self.enabled || self.total_bytes == 0 {
+            return;
+        }
+
+        let now = Instant::now();
+        if self
+            .last_draw
+            .is_some_and(|last_draw| now.duration_since(last_draw) < Duration::from_millis(200))
+        {
+            return;
+        }
+
+        let displayed_done = self.bytes_done.min(self.total_bytes);
+        let percent = (displayed_done as f64 / self.total_bytes as f64) * 100.0;
+        let elapsed = self.started.elapsed();
+        let line = format!(
+            "{} {:>5.1}%  {} / {}  {}/s  {}",
+            self.kind.label(),
+            percent,
+            format_byte_count(displayed_done),
+            format_byte_count(self.total_bytes),
+            format_transfer_rate(displayed_done, elapsed),
+            format_transfer_duration(elapsed),
+        );
+
+        let mut stderr = std::io::stderr().lock();
+        if write!(stderr, "\r\x1b[2K{line}")
+            .and_then(|_| stderr.flush())
+            .is_err()
+        {
+            self.enabled = false;
+            self.dirty_line = false;
+            return;
+        }
+
+        self.last_draw = Some(now);
+        self.dirty_line = true;
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct AgentFsStatData {
     exists: bool,
@@ -1999,7 +2105,7 @@ async fn run_agent_transfer_push(
     let final_root_paths = resolve_remote_batch_roots(target, destination, &manifest.roots).await?;
 
     if !atomic && !if_changed {
-        let summary = execute_push_manifest(target, &manifest, destination)
+        let summary = execute_push_manifest(target, &manifest, destination, None)
             .await
             .map_err(|err| {
                 map_operation_error(
@@ -2105,7 +2211,8 @@ async fn run_agent_transfer_push(
                 )
             })?;
 
-        let push_result = execute_push_manifest(target, &single_manifest, &temp_root_string).await;
+        let push_result =
+            execute_push_manifest(target, &single_manifest, &temp_root_string, None).await;
         let push_summary = match push_result {
             Ok(summary) => summary,
             Err(err) => {
@@ -3186,6 +3293,55 @@ fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+fn format_transfer_duration(duration: Duration) -> String {
+    if duration.as_secs() == 0 {
+        return format!("{}ms", duration.as_millis());
+    }
+
+    if duration.as_secs() < 60 {
+        return format!("{:.1}s", duration.as_secs_f64());
+    }
+
+    if duration.as_secs() < 3600 {
+        let minutes = duration.as_secs() / 60;
+        let seconds = duration.as_secs_f64() % 60.0;
+        return format!("{minutes}m {seconds:.1}s");
+    }
+
+    let hours = duration.as_secs() / 3600;
+    let minutes = (duration.as_secs() % 3600) / 60;
+    let seconds = duration.as_secs_f64() % 60.0;
+    format!("{hours}h {minutes}m {seconds:.1}s")
+}
+
+fn format_transfer_rate(bytes: u64, elapsed: Duration) -> String {
+    if elapsed.is_zero() {
+        return "0 B".to_string();
+    }
+
+    format_byte_units(bytes as f64 / elapsed.as_secs_f64())
+}
+
+fn format_byte_count(bytes: u64) -> String {
+    format_byte_units(bytes as f64)
+}
+
+fn format_byte_units(mut value: f64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+    let mut unit_index = 0usize;
+    while value >= 1024.0 && unit_index + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+
+    if unit_index == 0 {
+        return format!("{} {}", value as u64, UNITS[unit_index]);
+    }
+
+    format!("{value:.1} {}", UNITS[unit_index])
+}
+
 fn emit_agent_success<T>(_command: &str, data: T) -> Result<()>
 where
     T: Serialize,
@@ -3510,13 +3666,21 @@ async fn push_command(
     remote_path: &str,
 ) -> Result<()> {
     let addr = resolve_target(target)?;
-    let summary = execute_push(&addr, source_specs, remote_path).await?;
+    let started = Instant::now();
+    let mut progress = TransferProgress::new(TransferProgressKind::Push);
+    let result =
+        execute_push_with_progress(&addr, source_specs, remote_path, Some(&mut progress)).await;
+    let elapsed = started.elapsed();
+    progress.finish();
+    let summary = result?;
     println!(
-        "pushed {}\t{}\t{} entries\t{} bytes",
+        "pushed {}\t{}\t{} entries\t{} bytes\tin {}\t({}/s)",
         describe_sources(source_specs),
         remote_path,
         summary.entries_written,
-        summary.bytes_written
+        summary.bytes_written,
+        format_transfer_duration(elapsed),
+        format_transfer_rate(summary.bytes_written, elapsed),
     );
     Ok(())
 }
@@ -3527,15 +3691,28 @@ async fn pull_command(
     local_destination: &str,
 ) -> Result<()> {
     let addr = resolve_target(target)?;
-    let summary = execute_pull(&addr, remote_sources, local_destination).await?;
+    let started = Instant::now();
+    let mut progress = TransferProgress::new(TransferProgressKind::Pull);
+    let result = execute_pull_with_progress(
+        &addr,
+        remote_sources,
+        local_destination,
+        Some(&mut progress),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    progress.finish();
+    let summary = result?;
     let local_path = PathBuf::from(local_destination);
     println!(
-        "pulled {}\t{}\t{} entries\t{} / {} bytes",
+        "pulled {}\t{}\t{} entries\t{} / {} bytes\tin {}\t({}/s)",
         describe_sources(remote_sources),
         local_path.display(),
         summary.entries_received,
         summary.bytes_received,
-        summary.total_bytes
+        summary.total_bytes,
+        format_transfer_duration(elapsed),
+        format_transfer_rate(summary.bytes_received, elapsed),
     );
     Ok(())
 }
@@ -3654,14 +3831,27 @@ async fn execute_push(
     source_specs: &[String],
     remote_path: &str,
 ) -> Result<PushSummary> {
+    execute_push_with_progress(addr, source_specs, remote_path, None).await
+}
+
+async fn execute_push_with_progress(
+    addr: &str,
+    source_specs: &[String],
+    remote_path: &str,
+    mut progress: Option<&mut TransferProgress>,
+) -> Result<PushSummary> {
     let manifest = build_local_batch_manifest(source_specs)?;
-    execute_push_manifest(addr, &manifest, remote_path).await
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.set_total_bytes(manifest.total_bytes);
+    }
+    execute_push_manifest(addr, &manifest, remote_path, progress).await
 }
 
 async fn execute_push_manifest(
     addr: &str,
     manifest: &LocalBatchManifest,
     remote_path: &str,
+    progress: Option<&mut TransferProgress>,
 ) -> Result<PushSummary> {
     let mut stream = open_connection(&addr).await?;
     write_json_frame(
@@ -3685,7 +3875,7 @@ async fn execute_push_manifest(
         other => bail!("unexpected response from daemon: {other:?}"),
     }
 
-    let bytes_sent = stream_local_batch_files(&mut stream, &manifest.files).await?;
+    let bytes_sent = stream_local_batch_files(&mut stream, &manifest.files, progress).await?;
     if bytes_sent != manifest.total_bytes {
         bail!(
             "push size mismatch before completion: expected {} bytes, streamed {bytes_sent}",
@@ -3724,6 +3914,15 @@ async fn execute_pull(
     remote_sources: &[String],
     local_destination: &str,
 ) -> Result<PullSummary> {
+    execute_pull_with_progress(addr, remote_sources, local_destination, None).await
+}
+
+async fn execute_pull_with_progress(
+    addr: &str,
+    remote_sources: &[String],
+    local_destination: &str,
+    mut progress: Option<&mut TransferProgress>,
+) -> Result<PullSummary> {
     let mut stream = open_connection(&addr).await?;
     write_json_frame(
         &mut stream,
@@ -3747,6 +3946,9 @@ async fn execute_pull(
         }
         other => bail!("unexpected response from daemon: {other:?}"),
     };
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.set_total_bytes(total_bytes);
+    }
 
     let local_path = PathBuf::from(local_destination);
     let (entries_received, bytes_received) = receive_local_batch(
@@ -3755,6 +3957,7 @@ async fn execute_pull(
         local_destination,
         &roots,
         &entries,
+        progress,
     )
     .await?;
 
@@ -4129,7 +4332,11 @@ fn filter_local_batch_manifest(
     })
 }
 
-async fn stream_local_batch_files<S>(stream: &mut S, files: &[LocalBatchFile]) -> Result<u64>
+async fn stream_local_batch_files<S>(
+    stream: &mut S,
+    files: &[LocalBatchFile],
+    mut progress: Option<&mut TransferProgress>,
+) -> Result<u64>
 where
     S: AsyncWrite + Unpin,
 {
@@ -4159,6 +4366,9 @@ where
             .context("failed to stream file data")?;
             total_bytes += read as u64;
             file_bytes += read as u64;
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.advance(read as u64);
+            }
         }
         if file_bytes != file_entry.size {
             bail!(
@@ -4183,6 +4393,7 @@ async fn receive_local_batch<S>(
     destination_arg: &str,
     roots: &[TransferRoot],
     entries: &[TransferEntry],
+    mut progress: Option<&mut TransferProgress>,
 ) -> Result<(u64, u64)>
 where
     S: AsyncRead + Unpin,
@@ -4237,6 +4448,9 @@ where
                         })?;
                         remaining -= chunk_payload.len() as u64;
                         bytes_received += chunk_payload.len() as u64;
+                        if let Some(progress) = progress.as_deref_mut() {
+                            progress.advance(chunk_payload.len() as u64);
+                        }
                     }
                 }
                 file.flush().await?;
@@ -5728,5 +5942,28 @@ mod tests {
             .expect("editor should resolve");
         assert_eq!(editor.program, "code");
         assert_eq!(editor.args, vec!["--wait", "--reuse-window"]);
+    }
+
+    #[test]
+    fn format_transfer_duration_covers_short_and_long_values() {
+        assert_eq!(
+            format_transfer_duration(Duration::from_millis(750)),
+            "750ms"
+        );
+        assert_eq!(
+            format_transfer_duration(Duration::from_millis(1500)),
+            "1.5s"
+        );
+        assert_eq!(format_transfer_duration(Duration::from_secs(65)), "1m 5.0s");
+    }
+
+    #[test]
+    fn format_byte_units_use_binary_prefixes() {
+        assert_eq!(format_byte_count(999), "999 B");
+        assert_eq!(format_byte_count(1536), "1.5 KiB");
+        assert_eq!(
+            format_transfer_rate(2048, Duration::from_secs(1)),
+            "2.0 KiB"
+        );
     }
 }
