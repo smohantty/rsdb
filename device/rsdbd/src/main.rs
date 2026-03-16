@@ -28,8 +28,8 @@ use rustix_openpty::rustix::termios::Winsize;
 use rustix_openpty::{login_tty, openpty};
 use sha2::{Digest, Sha256};
 use tokio::fs::{File, OpenOptions, metadata};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::process::Command;
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
@@ -37,6 +37,10 @@ use tracing::{debug, trace, warn};
 
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_AGENT_FS_BYTES: u64 = 4 * 1024 * 1024;
+
+trait ConnectionStream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> ConnectionStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 #[derive(Debug, Parser)]
 #[command(name = "rsdbd")]
@@ -305,7 +309,10 @@ async fn handle_discovery(socket: UdpSocket, state: ServerState) -> Result<()> {
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, state: ServerState) -> Result<()> {
+async fn handle_connection<S>(mut stream: S, state: ServerState) -> Result<()>
+where
+    S: ConnectionStream + 'static,
+{
     let frame = match timeout(INITIAL_REQUEST_TIMEOUT, read_frame(&mut stream)).await {
         Ok(Ok(frame)) => frame,
         Ok(Err(ProtocolError::Io(err))) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -323,12 +330,15 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) -> Result<
     handle_request(stream, request_id, request, &state).await
 }
 
-async fn handle_request(
-    mut stream: TcpStream,
+async fn handle_request<S>(
+    mut stream: S,
     request_id: u32,
     request: ControlRequest,
     state: &ServerState,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: ConnectionStream + 'static,
+{
     match request {
         ControlRequest::Ping => {
             let response = ControlResponse::Pong {
@@ -550,8 +560,8 @@ fn capabilities() -> CapabilitySet {
     }
 }
 
-async fn handle_exec_request(
-    mut stream: TcpStream,
+async fn handle_exec_request<S>(
+    mut stream: S,
     request_id: u32,
     command: &str,
     args: &[String],
@@ -559,7 +569,10 @@ async fn handle_exec_request(
     timeout_secs: Option<u64>,
     stream_output: bool,
     state: &ServerState,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: ConnectionStream,
+{
     if stream_output {
         return match stream_command_output(
             &mut stream,
@@ -642,15 +655,18 @@ async fn execute_command(
     })
 }
 
-async fn stream_command_output(
-    stream: &mut TcpStream,
+async fn stream_command_output<S>(
+    stream: &mut S,
     request_id: u32,
     command: &str,
     args: &[String],
     cwd: Option<&str>,
     timeout_secs: Option<u64>,
     state: &ServerState,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: ConnectionStream,
+{
     if command.trim().is_empty() {
         bail!("command must not be empty");
     }
@@ -774,12 +790,15 @@ fn exec_timeout(timeout_secs: Option<u64>, default_timeout: Duration) -> Duratio
         .unwrap_or(default_timeout)
 }
 
-async fn handle_fs_stat(
-    stream: &mut TcpStream,
+async fn handle_fs_stat<S>(
+    stream: &mut S,
     request_id: u32,
     path: &str,
     hash: Option<HashAlgorithm>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: ConnectionStream,
+{
     let requested = validate_fs_path(path)?;
     let stat = run_blocking_fs({
         let requested = requested.clone();
@@ -797,15 +816,18 @@ async fn handle_fs_stat(
     Ok(())
 }
 
-async fn handle_fs_list(
-    stream: &mut TcpStream,
+async fn handle_fs_list<S>(
+    stream: &mut S,
     request_id: u32,
     path: &str,
     recursive: bool,
     max_depth: Option<u32>,
     include_hidden: bool,
     hash: Option<HashAlgorithm>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: ConnectionStream,
+{
     let requested = validate_fs_path(path)?;
     let entries = run_blocking_fs({
         let requested = requested.clone();
@@ -823,13 +845,16 @@ async fn handle_fs_list(
     Ok(())
 }
 
-async fn handle_fs_read(
-    stream: &mut TcpStream,
+async fn handle_fs_read<S>(
+    stream: &mut S,
     request_id: u32,
     path: &str,
     encoding: ContentEncoding,
     max_bytes: Option<u64>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: ConnectionStream,
+{
     let requested = validate_fs_path(path)?;
     let metadata = std::fs::symlink_metadata(&requested)
         .with_context(|| format!("failed to stat {}", requested.display()))?;
@@ -877,7 +902,7 @@ async fn handle_fs_read(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_fs_write(
-    stream: &mut TcpStream,
+    stream: &mut impl ConnectionStream,
     request_id: u32,
     path: &str,
     content: &str,
@@ -991,7 +1016,7 @@ async fn handle_fs_write(
 }
 
 async fn handle_fs_mkdir(
-    stream: &mut TcpStream,
+    stream: &mut impl ConnectionStream,
     request_id: u32,
     path: &str,
     parents: bool,
@@ -1051,7 +1076,7 @@ async fn handle_fs_mkdir(
 }
 
 async fn handle_fs_rm(
-    stream: &mut TcpStream,
+    stream: &mut impl ConnectionStream,
     request_id: u32,
     path: &str,
     recursive: bool,
@@ -1107,7 +1132,7 @@ async fn handle_fs_rm(
 }
 
 async fn handle_fs_move(
-    stream: &mut TcpStream,
+    stream: &mut impl ConnectionStream,
     request_id: u32,
     source: &str,
     destination: &str,
@@ -1470,13 +1495,16 @@ fn fs_precondition_failed(message: impl Into<String>) -> anyhow::Error {
     FsPreconditionError(message.into()).into()
 }
 
-async fn handle_push(
-    stream: &mut TcpStream,
+async fn handle_push<S>(
+    stream: &mut S,
     request_id: u32,
     path: &str,
     mode: u32,
     source_name: Option<String>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: ConnectionStream,
+{
     let resolved_path = resolve_push_destination(path, source_name.as_deref()).await?;
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -1562,7 +1590,10 @@ async fn resolve_push_destination(path: &str, source_name: Option<&str>) -> Resu
     Ok(requested)
 }
 
-async fn handle_pull(stream: &mut TcpStream, request_id: u32, path: &str) -> Result<()> {
+async fn handle_pull<S>(stream: &mut S, request_id: u32, path: &str) -> Result<()>
+where
+    S: ConnectionStream,
+{
     let file_meta = metadata(path)
         .await
         .with_context(|| format!("failed to stat remote path: {path}"))?;
@@ -1618,13 +1649,16 @@ async fn handle_pull(stream: &mut TcpStream, request_id: u32, path: &str) -> Res
     Ok(())
 }
 
-async fn handle_push_batch(
-    stream: &mut TcpStream,
+async fn handle_push_batch<S>(
+    stream: &mut S,
     request_id: u32,
     destination: &str,
     roots: &[TransferRoot],
     entries: &[TransferEntry],
-) -> Result<()> {
+) -> Result<()>
+where
+    S: ConnectionStream,
+{
     let root_paths = resolve_batch_destination_roots(destination, roots).await?;
     write_json_frame(
         stream,
@@ -1736,11 +1770,14 @@ async fn handle_push_batch(
     Ok(())
 }
 
-async fn handle_pull_batch(
-    stream: &mut TcpStream,
+async fn handle_pull_batch<S>(
+    stream: &mut S,
     request_id: u32,
     sources: &[String],
-) -> Result<()> {
+) -> Result<()>
+where
+    S: ConnectionStream,
+{
     let manifest = build_batch_manifest_from_sources(sources)?;
     write_json_frame(
         stream,
@@ -1935,11 +1972,14 @@ fn append_manifest_entry(
     Ok(())
 }
 
-async fn stream_batch_files(
-    stream: &mut TcpStream,
+async fn stream_batch_files<S>(
+    stream: &mut S,
     request_id: u32,
     files: &[BatchFileSource],
-) -> Result<u64> {
+) -> Result<u64>
+where
+    S: ConnectionStream,
+{
     let mut writer =
         tokio::io::BufWriter::with_capacity(HEADER_LEN + DEFAULT_STREAM_CHUNK_SIZE, &mut *stream);
     let mut buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
@@ -1985,12 +2025,15 @@ async fn stream_batch_files(
     Ok(total_bytes)
 }
 
-async fn read_file_stream_chunk_into(
-    stream: &mut TcpStream,
+async fn read_file_stream_chunk_into<S>(
+    stream: &mut S,
     request_id: u32,
     context_name: &str,
     payload: &mut Vec<u8>,
-) -> Result<rsdb_proto::StreamFrameHeader> {
+) -> Result<rsdb_proto::StreamFrameHeader>
+where
+    S: ConnectionStream,
+{
     let chunk = read_stream_frame_into(stream, payload)
         .await
         .with_context(|| format!("failed to read {context_name} frame"))?;
@@ -2011,12 +2054,15 @@ async fn read_file_stream_chunk_into(
     Ok(chunk)
 }
 
-async fn expect_file_stream_eof(
-    stream: &mut TcpStream,
+async fn expect_file_stream_eof<S>(
+    stream: &mut S,
     request_id: u32,
     context_name: &str,
     payload: &mut Vec<u8>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: ConnectionStream,
+{
     let chunk = read_file_stream_chunk_into(stream, request_id, context_name, payload).await?;
     if !chunk.eof || !payload.is_empty() {
         bail!("expected end of {context_name} file stream");
@@ -2155,8 +2201,8 @@ fn glob_match_options() -> MatchOptions {
     }
 }
 
-async fn handle_shell(
-    stream: TcpStream,
+async fn handle_shell<S>(
+    stream: S,
     request_id: u32,
     command: Option<String>,
     args: Vec<String>,
@@ -2165,7 +2211,10 @@ async fn handle_shell(
     rows: Option<u16>,
     cols: Option<u16>,
     state: &ServerState,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: ConnectionStream + 'static,
+{
     if pty {
         return handle_pty_shell(stream, request_id, command, args, term, rows, cols, state).await;
     }
@@ -2173,16 +2222,19 @@ async fn handle_shell(
     handle_pipe_shell(stream, request_id, command, args, state).await
 }
 
-async fn handle_pipe_shell(
-    stream: TcpStream,
+async fn handle_pipe_shell<S>(
+    stream: S,
     request_id: u32,
     command: Option<String>,
     args: Vec<String>,
     state: &ServerState,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: ConnectionStream + 'static,
+{
     let (display_command, mut child) =
         spawn_pipe_shell(command, args, &state.shell_path, &state.home_path)?;
-    let (mut reader, writer) = stream.into_split();
+    let (mut reader, writer) = tokio::io::split(stream);
     let mut writer = tokio::io::BufWriter::new(writer);
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(32);
     tokio::spawn(async move {
@@ -2319,8 +2371,8 @@ async fn handle_pipe_shell(
     Ok(())
 }
 
-async fn handle_pty_shell(
-    stream: TcpStream,
+async fn handle_pty_shell<S>(
+    stream: S,
     request_id: u32,
     command: Option<String>,
     args: Vec<String>,
@@ -2328,10 +2380,13 @@ async fn handle_pty_shell(
     rows: Option<u16>,
     cols: Option<u16>,
     state: &ServerState,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: ConnectionStream + 'static,
+{
     let (display_command, mut child, controller) =
         spawn_pty_shell(command, args, term, rows, cols, &state.shell_path, &state.home_path)?;
-    let (mut reader, writer) = stream.into_split();
+    let (mut reader, writer) = tokio::io::split(stream);
     let mut writer = tokio::io::BufWriter::new(writer);
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(32);
     tokio::spawn(async move {

@@ -29,7 +29,7 @@ use rsdb_proto::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -38,6 +38,12 @@ use tracing::{debug, trace};
 const REQUEST_ID: u32 = 1;
 const DEFAULT_RSDB_PORT: u16 = 27101;
 const DEFAULT_INLINE_EDIT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+trait ConnectionStream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> ConnectionStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+type BoxedConnectionStream = Box<dyn ConnectionStream>;
 
 struct RawModeGuard(bool);
 
@@ -4123,7 +4129,10 @@ fn filter_local_batch_manifest(
     })
 }
 
-async fn stream_local_batch_files(stream: &mut TcpStream, files: &[LocalBatchFile]) -> Result<u64> {
+async fn stream_local_batch_files<S>(stream: &mut S, files: &[LocalBatchFile]) -> Result<u64>
+where
+    S: AsyncWrite + Unpin,
+{
     let mut writer =
         tokio::io::BufWriter::with_capacity(HEADER_LEN + DEFAULT_STREAM_CHUNK_SIZE, &mut *stream);
     let mut buffer = vec![0_u8; DEFAULT_STREAM_CHUNK_SIZE];
@@ -4168,13 +4177,16 @@ async fn stream_local_batch_files(stream: &mut TcpStream, files: &[LocalBatchFil
     Ok(total_bytes)
 }
 
-async fn receive_local_batch(
-    stream: &mut TcpStream,
+async fn receive_local_batch<S>(
+    stream: &mut S,
     destination: &Path,
     destination_arg: &str,
     roots: &[TransferRoot],
     entries: &[TransferEntry],
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64)>
+where
+    S: AsyncRead + Unpin,
+{
     let root_paths = resolve_local_batch_roots(destination, destination_arg, roots)?;
     let mut entries_received = 0_u64;
     let mut bytes_received = 0_u64;
@@ -4248,11 +4260,14 @@ async fn receive_local_batch(
     Ok((entries_received, bytes_received))
 }
 
-async fn read_file_stream_chunk_into(
-    stream: &mut TcpStream,
+async fn read_file_stream_chunk_into<S>(
+    stream: &mut S,
     context_name: &str,
     payload: &mut Vec<u8>,
-) -> Result<rsdb_proto::StreamFrameHeader> {
+) -> Result<rsdb_proto::StreamFrameHeader>
+where
+    S: AsyncRead + Unpin,
+{
     let chunk = read_stream_frame_into(stream, payload)
         .await
         .with_context(|| format!("failed to read {context_name} frame"))?;
@@ -4266,11 +4281,14 @@ async fn read_file_stream_chunk_into(
     Ok(chunk)
 }
 
-async fn expect_file_stream_eof(
-    stream: &mut TcpStream,
+async fn expect_file_stream_eof<S>(
+    stream: &mut S,
     context_name: &str,
     payload: &mut Vec<u8>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + Unpin,
+{
     let chunk = read_file_stream_chunk_into(stream, context_name, payload).await?;
     if !chunk.eof || !payload.is_empty() {
         bail!("expected end of {context_name} file stream");
@@ -4442,7 +4460,7 @@ async fn run_shell_session(
         }
         other => bail!("unexpected response from daemon: {other:?}"),
     }
-    let (mut reader, writer) = stream.into_split();
+    let (mut reader, writer) = tokio::io::split(stream);
     let mut writer = tokio::io::BufWriter::new(writer);
     let (frame_tx, mut frame_rx) = mpsc::channel(32);
     tokio::spawn(async move {
@@ -4800,7 +4818,11 @@ async fn write_local_edit_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(
     Ok(())
 }
 
-async fn open_connection(addr: &str) -> Result<TcpStream> {
+async fn open_connection(addr: &str) -> Result<BoxedConnectionStream> {
+    Ok(Box::new(open_tcp_connection(addr).await?))
+}
+
+async fn open_tcp_connection(addr: &str) -> Result<TcpStream> {
     debug!(target_addr = %addr, "opening tcp connection");
     let stream = timeout(Duration::from_secs(5), TcpStream::connect(addr))
         .await
@@ -4812,7 +4834,10 @@ async fn open_connection(addr: &str) -> Result<TcpStream> {
     Ok(stream)
 }
 
-async fn read_response(stream: &mut TcpStream) -> Result<ControlResponse> {
+async fn read_response<S>(stream: &mut S) -> Result<ControlResponse>
+where
+    S: AsyncRead + Unpin,
+{
     let frame = read_frame(stream)
         .await
         .context("failed to read response")?;
