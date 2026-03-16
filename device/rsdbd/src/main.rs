@@ -1770,11 +1770,7 @@ where
     Ok(())
 }
 
-async fn handle_pull_batch<S>(
-    stream: &mut S,
-    request_id: u32,
-    sources: &[String],
-) -> Result<()>
+async fn handle_pull_batch<S>(stream: &mut S, request_id: u32, sources: &[String]) -> Result<()>
 where
     S: ConnectionStream,
 {
@@ -2384,8 +2380,15 @@ async fn handle_pty_shell<S>(
 where
     S: ConnectionStream + 'static,
 {
-    let (display_command, mut child, controller) =
-        spawn_pty_shell(command, args, term, rows, cols, &state.shell_path, &state.home_path)?;
+    let (display_command, mut child, controller) = spawn_pty_shell(
+        command,
+        args,
+        term,
+        rows,
+        cols,
+        &state.shell_path,
+        &state.home_path,
+    )?;
     let (mut reader, writer) = tokio::io::split(stream);
     let mut writer = tokio::io::BufWriter::new(writer);
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(32);
