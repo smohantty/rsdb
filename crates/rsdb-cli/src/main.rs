@@ -1,4 +1,5 @@
 use base64::Engine as _;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
@@ -451,10 +452,10 @@ struct AgentExecData {
 }
 
 #[derive(Debug, Serialize)]
-struct AgentExecChunkData {
+struct AgentExecChunkData<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    target: Option<String>,
-    chunk: String,
+    target: Option<&'a str>,
+    chunk: Cow<'a, str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1661,8 +1662,8 @@ async fn run_agent_exec_stream(
                         "exec",
                         event,
                         Some(AgentExecChunkData {
-                            target: response_target.clone(),
-                            chunk: String::from_utf8_lossy(&frame_payload).into_owned(),
+                            target: response_target.as_deref(),
+                            chunk: String::from_utf8_lossy(&frame_payload),
                         }),
                     )
                     .map_err(internal_agent_failure)?;
@@ -1695,8 +1696,8 @@ async fn run_agent_exec_stream(
                                 "exec",
                                 "stdout",
                                 Some(AgentExecChunkData {
-                                    target: response_target.clone(),
-                                    chunk: stdout,
+                                    target: response_target.as_deref(),
+                                    chunk: Cow::Borrowed(stdout.as_str()),
                                 }),
                             )
                             .map_err(internal_agent_failure)?;
@@ -1706,8 +1707,8 @@ async fn run_agent_exec_stream(
                                 "exec",
                                 "stderr",
                                 Some(AgentExecChunkData {
-                                    target: response_target.clone(),
-                                    chunk: stderr,
+                                    target: response_target.as_deref(),
+                                    chunk: Cow::Borrowed(stderr.as_str()),
                                 }),
                             )
                             .map_err(internal_agent_failure)?;
@@ -5685,6 +5686,17 @@ mod tests {
         .expect("agent exec data should serialize");
 
         assert_eq!(value, serde_json::json!({ "status": 0 }));
+    }
+
+    #[test]
+    fn agent_exec_chunk_data_serializes_borrowed_payloads() {
+        let value = serde_json::to_value(AgentExecChunkData {
+            target: None,
+            chunk: Cow::Borrowed("hello"),
+        })
+        .expect("agent exec chunk should serialize");
+
+        assert_eq!(value, serde_json::json!({ "chunk": "hello" }));
     }
 
     #[test]
