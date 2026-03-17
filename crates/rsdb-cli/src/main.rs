@@ -739,7 +739,7 @@ impl fmt::Display for RemoteControlError {
 
 impl std::error::Error for RemoteControlError {}
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
