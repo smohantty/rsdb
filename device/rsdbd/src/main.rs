@@ -2537,16 +2537,16 @@ fn spawn_pipe_shell(
         Some(command) if !command.trim().is_empty() => {
             let command_line = join_shell_command(&command, &args);
             (
-                format!("{shell} -c {command_line}"),
+                format!("{shell} -lc {command_line}"),
                 shell.to_string(),
-                vec!["-c".to_string(), command_line],
+                vec!["-lc".to_string(), command_line],
             )
         }
         Some(_) => bail!("shell command must not be empty"),
         None => (
-            format!("{shell} -i"),
+            format!("{shell} -l -i"),
             shell.to_string(),
-            vec!["-i".to_string()],
+            vec!["-l".to_string(), "-i".to_string()],
         ),
     };
 
@@ -2576,16 +2576,16 @@ fn spawn_pty_shell(
         Some(command) if !command.trim().is_empty() => {
             let command_line = join_shell_command(&command, &args);
             (
-                format!("{shell} -c {command_line}"),
+                format!("{shell} -lc {command_line}"),
                 shell.to_string(),
-                vec!["-c".to_string(), command_line],
+                vec!["-lc".to_string(), command_line],
             )
         }
         Some(_) => bail!("shell command must not be empty"),
         None => (
-            format!("{shell} -i"),
+            format!("{shell} -l -i"),
             shell.to_string(),
-            vec!["-i".to_string()],
+            vec!["-l".to_string(), "-i".to_string()],
         ),
     };
 
