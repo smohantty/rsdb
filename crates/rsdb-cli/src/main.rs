@@ -33,11 +33,13 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, trace};
 
 const REQUEST_ID: u32 = 1;
 const DEFAULT_RSDB_PORT: u16 = 27101;
+const DEFAULT_DISCOVERY_TIMEOUT_MS: u64 = 1000;
 const DEFAULT_INLINE_EDIT_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 trait ConnectionStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -89,7 +91,7 @@ enum Commands {
     Discover {
         #[arg(long, default_value = "255.255.255.255")]
         probe_addr: String,
-        #[arg(long, default_value_t = 3000)]
+        #[arg(long, default_value_t = DEFAULT_DISCOVERY_TIMEOUT_MS)]
         timeout_ms: u64,
     },
     /// Check whether a target daemon responds.
@@ -157,7 +159,7 @@ enum AgentCommands {
     Discover {
         #[arg(long, default_value = "255.255.255.255")]
         probe_addr: String,
-        #[arg(long, default_value_t = 3000)]
+        #[arg(long, default_value_t = DEFAULT_DISCOVERY_TIMEOUT_MS)]
         timeout_ms: u64,
     },
     /// Execute one direct remote process with JSON output.
@@ -992,69 +994,107 @@ async fn devices_command() -> Result<()> {
 }
 
 async fn discover_command(probe_addr: &str, timeout_ms: u64) -> Result<()> {
-    let targets = discover_targets(probe_addr, timeout_ms).await?;
-    if targets.is_empty() {
-        println!("no devices discovered");
-        return Ok(());
-    }
+    let mut printed_any = false;
+    discover_targets_with_callback(probe_addr, timeout_ms, |target| {
+        if !printed_any {
+            println!("{:<16}   {:<21}   PLATFORM", "NAME", "ADDRESS");
+            printed_any = true;
+        }
 
-    let name_width = targets
-        .iter()
-        .map(|t| t.device_name.len())
-        .max()
-        .unwrap_or(0)
-        .max(4);
-    let addr_width = targets
-        .iter()
-        .map(|t| display_socket_addr(t.addr).len())
-        .max()
-        .unwrap_or(0)
-        .max(7);
-    let warning_width = targets
-        .iter()
-        .filter_map(|target| protocol_warning_text(target.protocol_version))
-        .map(|warning| warning.len())
-        .max()
-        .unwrap_or(0);
-    if warning_width > 0 {
-        println!(
-            "{:<name_width$}   {:<addr_width$}   {:<44}   WARNING",
-            "NAME", "ADDRESS", "PLATFORM",
-        );
-    } else {
-        println!(
-            "{:<name_width$}   {:<addr_width$}   PLATFORM",
-            "NAME", "ADDRESS",
-        );
-    }
-    for target in &targets {
         let warning = protocol_warning_text(target.protocol_version).unwrap_or_default();
-        if warning_width > 0 {
+        if warning.is_empty() {
             println!(
-                "{:<name_width$}   {:<addr_width$}   {:<44}   {}",
+                "{:<16}   {:<21}   {}",
+                target.device_name,
+                display_socket_addr(target.addr),
+                target.platform,
+            );
+        } else {
+            println!(
+                "{:<16}   {:<21}   {}   {}",
                 target.device_name,
                 display_socket_addr(target.addr),
                 target.platform,
                 warning,
             );
-        } else {
-            println!(
-                "{:<name_width$}   {:<addr_width$}   {}",
-                target.device_name,
-                display_socket_addr(target.addr),
-                target.platform,
-            );
         }
+
+        let _ = std::io::stdout().flush();
+    })
+    .await?;
+
+    if !printed_any {
+        println!("no devices discovered");
     }
     Ok(())
 }
 
 async fn discover_targets(probe_addr: &str, timeout_ms: u64) -> Result<Vec<DiscoveredTarget>> {
+    discover_targets_with_callback(probe_addr, timeout_ms, |_| {}).await
+}
+
+async fn discover_targets_with_callback<F>(
+    probe_addr: &str,
+    timeout_ms: u64,
+    on_target: F,
+) -> Result<Vec<DiscoveredTarget>>
+where
+    F: FnMut(&DiscoveredTarget),
+{
+    let destinations = discovery_probe_addresses(probe_addr)?
+        .into_iter()
+        .map(|probe_ip| SocketAddr::new(probe_ip, DEFAULT_RSDB_PORT))
+        .collect();
+    discover_targets_at_with_callback(destinations, timeout_ms, on_target).await
+}
+
+#[cfg(test)]
+async fn discover_targets_at(
+    destinations: Vec<SocketAddr>,
+    timeout_ms: u64,
+) -> Result<Vec<DiscoveredTarget>> {
+    discover_targets_at_with_callback(destinations, timeout_ms, |_| {}).await
+}
+
+async fn discover_targets_at_with_callback<F>(
+    destinations: Vec<SocketAddr>,
+    timeout_ms: u64,
+    mut on_target: F,
+) -> Result<Vec<DiscoveredTarget>>
+where
+    F: FnMut(&DiscoveredTarget),
+{
     let mut discovered = BTreeMap::<String, DiscoveredTarget>::new();
-    for probe_ip in discovery_probe_addresses(probe_addr)? {
-        for target in discover_targets_once(probe_ip, DEFAULT_RSDB_PORT, timeout_ms).await? {
-            let key = format!("{}@{}", target.device_name, target.addr);
-            discovered.insert(key, target);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut tasks = JoinSet::new();
+    for destination in destinations {
+        let tx = tx.clone();
+        tasks.spawn(async move { discover_targets_once(destination, timeout_ms, tx).await });
+    }
+    drop(tx);
+
+    loop {
+        tokio::select! {
+            received = rx.recv() => {
+                match received {
+                    Some(target) => {
+                        let key = format!("{}@{}", target.device_name, target.addr);
+                        if discovered.insert(key, target.clone()).is_none() {
+                            on_target(&target);
+                        }
+                    }
+                    None => {
+                        if tasks.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+            joined = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(joined) = joined {
+                    joined.context("discovery task failed")??;
+                }
+            }
         }
     }
 
@@ -1132,18 +1172,18 @@ fn discovery_probe_addresses(probe_addr: &str) -> Result<Vec<IpAddr>> {
 }
 
 async fn discover_targets_once(
-    probe_ip: IpAddr,
-    port: u16,
+    destination: SocketAddr,
     timeout_ms: u64,
-) -> Result<Vec<DiscoveredTarget>> {
-    let bind_addr = match probe_ip {
+    sender: mpsc::UnboundedSender<DiscoveredTarget>,
+) -> Result<()> {
+    let bind_addr = match destination.ip() {
         IpAddr::V4(_) => "0.0.0.0:0",
         IpAddr::V6(_) => "[::]:0",
     };
     let socket = UdpSocket::bind(bind_addr)
         .await
         .with_context(|| format!("failed to bind discovery socket on {bind_addr}"))?;
-    if probe_ip.is_ipv4() {
+    if destination.is_ipv4() {
         socket
             .set_broadcast(true)
             .context("failed to enable UDP broadcast")?;
@@ -1152,7 +1192,6 @@ async fn discover_targets_once(
     let nonce = discovery_nonce();
     let request = DiscoveryRequest::Probe { nonce };
     let payload = encode_discovery_message(&request).context("failed to encode discovery probe")?;
-    let destination = SocketAddr::new(probe_ip, port);
     socket
         .send_to(&payload, destination)
         .await
@@ -1160,7 +1199,7 @@ async fn discover_targets_once(
 
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
     let mut buffer = vec![0_u8; MAX_DISCOVERY_PAYLOAD_LEN + rsdb_proto::DISCOVERY_MAGIC.len()];
-    let mut discovered = BTreeMap::<String, DiscoveredTarget>::new();
+    let mut discovered = BTreeMap::<String, ()>::new();
 
     loop {
         let now = tokio::time::Instant::now();
@@ -1186,20 +1225,19 @@ async fn discover_targets_once(
 
         let addr = SocketAddr::new(peer.ip(), response.tcp_port);
         let key = format!("{}@{}", response.server_id, addr);
-        discovered.insert(
-            key,
-            DiscoveredTarget {
+        if discovered.insert(key, ()).is_none() {
+            let _ = sender.send(DiscoveredTarget {
                 server_id: response.server_id,
                 device_name: response.device_name,
                 addr,
                 platform: response.platform,
                 protocol_version: response.protocol_version,
                 features: response.features,
-            },
-        );
+            });
+        }
     }
 
-    Ok(discovered.into_values().collect())
+    Ok(())
 }
 
 type AgentResult<T> = std::result::Result<T, AgentCommandFailure>;
@@ -5312,6 +5350,7 @@ fn normalize_mode(_mode: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, SocketAddrV4};
 
     #[test]
     fn supported_agent_operations_require_compatibility() {
@@ -5979,5 +6018,94 @@ mod tests {
             format_transfer_rate(2048, Duration::from_secs(1)),
             "2.0 KiB"
         );
+    }
+
+    #[tokio::test]
+    async fn discover_targets_at_probes_destinations_concurrently() {
+        let idle_v4_a = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("first idle socket should bind");
+        let idle_v4_b = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("second idle socket should bind");
+        let destinations = vec![
+            idle_v4_a.local_addr().expect("first local addr"),
+            idle_v4_b.local_addr().expect("second local addr"),
+        ];
+
+        let started = Instant::now();
+        let discovered = discover_targets_at(destinations, 200)
+            .await
+            .expect("discovery should succeed");
+
+        assert!(discovered.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_millis(350),
+            "expected concurrent probing, elapsed {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_targets_stream_callback_fires_before_full_timeout() {
+        let daemon = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("daemon socket should bind");
+        let destination = daemon.local_addr().expect("daemon local addr");
+        let responder = tokio::spawn(async move {
+            let mut buffer =
+                vec![0_u8; MAX_DISCOVERY_PAYLOAD_LEN + rsdb_proto::DISCOVERY_MAGIC.len()];
+            let (len, peer) = daemon
+                .recv_from(&mut buffer)
+                .await
+                .expect("daemon should receive a probe");
+            let request: DiscoveryRequest =
+                decode_discovery_message(&buffer[..len]).expect("probe should decode");
+            let DiscoveryRequest::Probe { nonce } = request;
+            let response = DiscoveryResponse {
+                nonce,
+                server_id: "rsdbd-test".to_string(),
+                device_name: "TestDevice".to_string(),
+                tcp_port: DEFAULT_RSDB_PORT,
+                platform: "TestOS".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                features: vec!["discover.udp".to_string()],
+            };
+            let payload =
+                encode_discovery_message(&response).expect("response should encode successfully");
+            daemon
+                .send_to(&payload, peer)
+                .await
+                .expect("daemon should reply");
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let started = Instant::now();
+        let discover = tokio::spawn(async move {
+            discover_targets_at_with_callback(vec![destination], 200, |target| {
+                let _ = tx.send((started.elapsed(), target.device_name.clone()));
+            })
+            .await
+        });
+
+        let (elapsed, device_name) = timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("callback should fire before the full timeout")
+            .expect("callback should send a target");
+        assert_eq!(device_name, "TestDevice");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "expected callback before full timeout, elapsed {:?}",
+            elapsed
+        );
+
+        let discovered = discover
+            .await
+            .expect("discover task should join")
+            .expect("discover should succeed");
+        responder.await.expect("responder should join");
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].device_name, "TestDevice");
     }
 }
