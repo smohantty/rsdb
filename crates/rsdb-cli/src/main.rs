@@ -320,6 +320,23 @@ struct DiscoveredTarget {
 }
 
 #[derive(Debug, Clone)]
+struct DeviceStatusRow {
+    is_current: bool,
+    display_name: String,
+    addr: String,
+    platform: String,
+    status: String,
+    warning: String,
+}
+
+#[derive(Debug, Clone)]
+struct DeviceProbeOutcome {
+    index: usize,
+    updated_name: Option<String>,
+    row: DeviceStatusRow,
+}
+
+#[derive(Debug, Clone)]
 struct LocalBatchFile {
     root_index: u32,
     path: PathBuf,
@@ -902,69 +919,52 @@ async fn devices_command() -> Result<()> {
         return Ok(());
     }
     let current_addr = primary_target(&registry).map(|target| target.addr.clone());
-    let mut rows = Vec::with_capacity(registry.targets.len());
+    let mut rows = vec![None; registry.targets.len()];
     let mut changed = false;
+    let mut tasks = JoinSet::new();
 
-    for target in &mut registry.targets {
-        let mut display_name = target.name.clone();
-        let mut platform = "-".to_string();
-        let mut warning = String::new();
-        let status =
-            if let Some(discovered) = discover_target_at(&target.addr, 300).await.ok().flatten() {
-                display_name = discovered.device_name.clone();
-                platform = discovered.platform;
-                warning = protocol_warning_text(discovered.protocol_version).unwrap_or_default();
-                if is_legacy_auto_name(&target.name, &target.addr)
-                    && discovered.device_name != target.name
-                {
-                    target.name = discovered.device_name.clone();
-                    changed = true;
-                }
-                "online".to_string()
-            } else {
-                match request(&target.addr, ControlRequest::Ping).await {
-                    Ok(ControlResponse::Pong { .. }) => "online".to_string(),
-                    Ok(other) => format!("unexpected ({other:?})"),
-                    Err(err) => format!("offline ({err})"),
-                }
-            };
-        rows.push((
-            current_addr.as_deref() == Some(&target.addr),
-            display_name,
-            display_addr(&target.addr),
-            platform,
-            status,
-            warning,
-        ));
+    for (index, target) in registry.targets.iter().cloned().enumerate() {
+        let is_current = current_addr.as_deref() == Some(target.addr.as_str());
+        tasks.spawn(async move { probe_saved_target(index, target, is_current).await });
+    }
+
+    while let Some(joined) = tasks.join_next().await {
+        let outcome = joined.context("device probe task failed")?;
+        if let Some(updated_name) = outcome.updated_name {
+            registry.targets[outcome.index].name = updated_name;
+            changed = true;
+        }
+        rows[outcome.index] = Some(outcome.row);
     }
 
     if changed {
         save_registry(&registry)?;
     }
 
+    let rows = rows
+        .into_iter()
+        .map(|row| row.expect("every device probe should populate one row"))
+        .collect::<Vec<_>>();
+
     let name_width = rows
         .iter()
-        .map(|(_, name, _, _, _, _)| name.len())
+        .map(|row| row.display_name.len())
         .max()
         .unwrap_or(0)
         .max(4);
     let addr_width = rows
         .iter()
-        .map(|(_, _, addr, _, _, _)| addr.len())
+        .map(|row| row.addr.len())
         .max()
         .unwrap_or(0)
         .max(7);
     let platform_width = rows
         .iter()
-        .map(|(_, _, _, platform, _, _)| platform.len())
+        .map(|row| row.platform.len())
         .max()
         .unwrap_or(0)
         .max(8);
-    let warning_width = rows
-        .iter()
-        .map(|(_, _, _, _, _, warning)| warning.len())
-        .max()
-        .unwrap_or(0);
+    let warning_width = rows.iter().map(|row| row.warning.len()).max().unwrap_or(0);
     if warning_width > 0 {
         println!(
             "{:<7}   {:<name_width$}   {:<addr_width$}   {:<platform_width$}   {:<6}   WARNING",
@@ -976,21 +976,63 @@ async fn devices_command() -> Result<()> {
             "CURRENT", "NAME", "ADDRESS", "PLATFORM",
         );
     }
-    for (is_current, display_name, addr, platform, status, warning) in rows {
-        let current = if is_current { "*" } else { "" };
+    for row in rows {
+        let current = if row.is_current { "*" } else { "" };
         if warning_width > 0 {
             println!(
                 "{:<7}   {:<name_width$}   {:<addr_width$}   {:<platform_width$}   {:<6}   {}",
-                current, display_name, addr, platform, status, warning,
+                current, row.display_name, row.addr, row.platform, row.status, row.warning,
             );
         } else {
             println!(
                 "{:<7}   {:<name_width$}   {:<addr_width$}   {:<platform_width$}   {}",
-                current, display_name, addr, platform, status,
+                current, row.display_name, row.addr, row.platform, row.status,
             );
         }
     }
     Ok(())
+}
+
+async fn probe_saved_target(
+    index: usize,
+    target: StoredTarget,
+    is_current: bool,
+) -> DeviceProbeOutcome {
+    let mut display_name = target.name.clone();
+    let mut platform = "-".to_string();
+    let mut warning = String::new();
+    let mut updated_name = None;
+    let status = if let Some(discovered) =
+        discover_target_at(&target.addr, 300).await.ok().flatten()
+    {
+        display_name = discovered.device_name.clone();
+        platform = discovered.platform;
+        warning = protocol_warning_text(discovered.protocol_version).unwrap_or_default();
+        if is_legacy_auto_name(&target.name, &target.addr) && discovered.device_name != target.name
+        {
+            updated_name = Some(discovered.device_name.clone());
+        }
+        "online".to_string()
+    } else {
+        match request(&target.addr, ControlRequest::Ping).await {
+            Ok(ControlResponse::Pong { .. }) => "online".to_string(),
+            Ok(other) => format!("unexpected ({other:?})"),
+            Err(err) => format!("offline ({err})"),
+        }
+    };
+
+    DeviceProbeOutcome {
+        index,
+        updated_name,
+        row: DeviceStatusRow {
+            is_current,
+            display_name,
+            addr: display_addr(&target.addr),
+            platform,
+            status,
+            warning,
+        },
+    }
 }
 
 async fn discover_command(probe_addr: &str, timeout_ms: u64) -> Result<()> {
