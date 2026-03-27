@@ -2,7 +2,6 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_SCRIPT="$ROOT_DIR/scripts/build-rsdbd-rpm.sh"
 REMOTE="origin"
 
 usage() {
@@ -126,17 +125,11 @@ done
 require_command git
 require_command gh
 require_command cargo
-require_command rpmbuild
 require_command sha256sum
 require_command awk
 
 if ! cargo tizen --version >/dev/null 2>&1; then
     echo "error: cargo-tizen is required" >&2
-    exit 1
-fi
-
-if [[ ! -x "$BUILD_SCRIPT" ]]; then
-    echo "error: build script is missing or not executable: $BUILD_SCRIPT" >&2
     exit 1
 fi
 
@@ -202,11 +195,11 @@ if [[ "$HEAD_COMMIT" != "$REMOTE_MAIN_COMMIT" ]]; then
 fi
 
 echo "Building release assets"
-"$BUILD_SCRIPT" aarch64
-"$BUILD_SCRIPT" armv7l
+(cd "$ROOT_DIR" && cargo tizen rpm -p rsdbd -A aarch64 --cargo-release)
+(cd "$ROOT_DIR" && cargo tizen rpm -p rsdbd -A armv7l --cargo-release)
 
-AARCH64_RPM="$ROOT_DIR/target/packages/rpm/aarch64/RPMS/aarch64/rsdbd-$VERSION-1.aarch64.rpm"
-ARMV7L_RPM="$ROOT_DIR/target/packages/rpm/armv7l/RPMS/armv7l/rsdbd-$VERSION-1.armv7l.rpm"
+AARCH64_RPM="$ROOT_DIR/target/tizen/aarch64/release/rpmbuild/RPMS/aarch64/rsdbd-$VERSION-1.aarch64.rpm"
+ARMV7L_RPM="$ROOT_DIR/target/tizen/armv7l/release/rpmbuild/RPMS/armv7l/rsdbd-$VERSION-1.armv7l.rpm"
 
 for asset in "$AARCH64_RPM" "$ARMV7L_RPM"; do
     if [[ ! -f "$asset" ]]; then

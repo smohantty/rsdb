@@ -2,7 +2,6 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_SCRIPT="$ROOT_DIR/scripts/build-rsdbd-rpm.sh"
 TARGET=""
 WAIT_SECS=60
 
@@ -129,8 +128,8 @@ require_command awk
 require_command rsdb
 require_command date
 
-if [[ ! -x "$BUILD_SCRIPT" ]]; then
-    echo "error: build script is missing or not executable: $BUILD_SCRIPT" >&2
+if ! cargo tizen --version >/dev/null 2>&1; then
+    echo "error: cargo-tizen is required" >&2
     exit 1
 fi
 
@@ -168,9 +167,9 @@ BEFORE_START_MARKER="$(
 )"
 
 echo "Building rsdbd RPM for $TARGET_ARCH"
-"$BUILD_SCRIPT" "$TARGET_ARCH"
+(cd "$ROOT_DIR" && cargo tizen rpm -p rsdbd -A "$TARGET_ARCH" --cargo-release)
 
-RPM_PATH="$ROOT_DIR/target/packages/rpm/$TARGET_ARCH/RPMS/$TARGET_ARCH/rsdbd-$CLI_VERSION-1.$TARGET_ARCH.rpm"
+RPM_PATH="$ROOT_DIR/target/tizen/$TARGET_ARCH/release/rpmbuild/RPMS/$TARGET_ARCH/rsdbd-$CLI_VERSION-1.$TARGET_ARCH.rpm"
 if [[ ! -f "$RPM_PATH" ]]; then
     echo "error: expected RPM not found: $RPM_PATH" >&2
     exit 1
