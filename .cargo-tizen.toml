@@ -1,5 +1,6 @@
 [default]
 arch = "aarch64"
+package = "rsdbd"
 profile = "tizen"
 platform_version = "10.0"
 provider = "rootstrap"
