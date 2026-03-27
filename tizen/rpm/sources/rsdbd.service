@@ -1,0 +1,13 @@
+[Unit]
+Description=RSDB root daemon
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/rsdbd.env
+ExecStart=/usr/bin/rsdbd --listen 0.0.0.0:27101 --server-id rsdbd-%m
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

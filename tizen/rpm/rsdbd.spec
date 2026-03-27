@@ -9,6 +9,8 @@ License:        MIT OR Apache-2.0
 AutoReqProv:    no
 
 Source0:        rsdbd
+Source1:        rsdbd.service
+Source2:        rsdbd.env
 
 %description
 RSDB root daemon for Tizen devices. Installs the daemon binary, systemd unit,
@@ -19,32 +21,9 @@ and default runtime environment file.
 %build
 
 %install
-install -Dpm0755 %{SOURCE0} %{buildroot}/usr/bin/rsdbd
-
-install -d %{buildroot}/usr/lib/systemd/system
-cat > %{buildroot}/usr/lib/systemd/system/rsdbd.service << 'UNIT'
-[Unit]
-Description=RSDB root daemon
-After=network.target
-
-[Service]
-Type=simple
-EnvironmentFile=-/etc/rsdbd.env
-ExecStart=/usr/bin/rsdbd --listen 0.0.0.0:27101 --server-id rsdbd-%m
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-chmod 0644 %{buildroot}/usr/lib/systemd/system/rsdbd.service
-
-install -d %{buildroot}/etc
-cat > %{buildroot}/etc/rsdbd.env << 'ENV'
-RUST_LOG=debug
-RSDB_LOG_FILE=/var/log/rsdbd.log
-ENV
-chmod 0644 %{buildroot}/etc/rsdbd.env
+install -Dm0755 %{SOURCE0} %{buildroot}/usr/bin/rsdbd
+install -Dm0644 %{SOURCE1} %{buildroot}/usr/lib/systemd/system/rsdbd.service
+install -Dm0644 %{SOURCE2} %{buildroot}/etc/rsdbd.env
 
 %pre
 if [ "$1" -gt 1 ] && command -v systemctl >/dev/null 2>&1; then
