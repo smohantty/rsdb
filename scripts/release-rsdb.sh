@@ -196,8 +196,8 @@ if [[ "$HEAD_COMMIT" != "$REMOTE_MAIN_COMMIT" ]]; then
 fi
 
 echo "Building release assets"
-(cd "$ROOT_DIR" && cargo tizen rpm -p rsdbd -A aarch64 --cargo-release)
-(cd "$ROOT_DIR" && cargo tizen rpm -p rsdbd -A armv7l --cargo-release)
+(cd "$ROOT_DIR" && cargo tizen rpm --package rsdbd --arch aarch64 --release)
+(cd "$ROOT_DIR" && cargo tizen rpm --package rsdbd --arch armv7l --release)
 
 AARCH64_RPM="$ROOT_DIR/target/tizen/aarch64/release/rpmbuild/RPMS/aarch64/rsdbd-$VERSION-1.aarch64.rpm"
 ARMV7L_RPM="$ROOT_DIR/target/tizen/armv7l/release/rpmbuild/RPMS/armv7l/rsdbd-$VERSION-1.armv7l.rpm"

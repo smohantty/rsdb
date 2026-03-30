@@ -167,7 +167,7 @@ BEFORE_START_MARKER="$(
 )"
 
 echo "Building rsdbd RPM for $TARGET_ARCH"
-(cd "$ROOT_DIR" && cargo tizen rpm -p rsdbd -A "$TARGET_ARCH" --cargo-release)
+(cd "$ROOT_DIR" && cargo tizen rpm --package rsdbd --arch "$TARGET_ARCH" --release)
 
 RPM_PATH="$ROOT_DIR/target/tizen/$TARGET_ARCH/release/rpmbuild/RPMS/$TARGET_ARCH/rsdbd-$CLI_VERSION-1.$TARGET_ARCH.rpm"
 if [[ ! -f "$RPM_PATH" ]]; then
