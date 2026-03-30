@@ -150,7 +150,8 @@ fi
 
 gh auth status >/dev/null
 
-git fetch "$REMOTE" main --tags >/dev/null
+# Refresh previously moved release tags so same-version reruns do not die on fetch.
+git fetch --force "$REMOTE" main --tags >/dev/null
 
 if ! git show-ref --verify --quiet "refs/remotes/$REMOTE/main"; then
     echo "error: remote branch not found: $REMOTE/main" >&2
