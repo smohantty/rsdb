@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs::File as StdFile, fs::OpenOptions as StdOpenOptions, io};
 
@@ -317,7 +317,7 @@ async fn handle_discovery(socket: UdpSocket, state: ServerState) -> Result<()> {
                     platform: state.platform.to_string(),
                     tcp_port: state.tcp_port,
                     protocol_version: PROTOCOL_VERSION,
-                    features: capabilities().features,
+                    features: capabilities().features.clone(),
                 };
                 let payload = encode_discovery_message(&response)?;
                 socket
@@ -370,7 +370,7 @@ where
         ControlRequest::GetCapabilities => {
             let response = ControlResponse::Capabilities {
                 server_id: state.server_id.to_string(),
-                capability: capabilities(),
+                capability: capabilities().clone(),
             };
             write_json_frame(&mut stream, FrameKind::Response, request_id, &response).await?;
         }
@@ -548,8 +548,8 @@ where
     Ok(())
 }
 
-fn capabilities() -> CapabilitySet {
-    CapabilitySet {
+fn capabilities() -> &'static CapabilitySet {
+    static CAPABILITIES: LazyLock<CapabilitySet> = LazyLock::new(|| CapabilitySet {
         protocol_version: PROTOCOL_VERSION,
         transports: vec!["tcp".to_string(), "udp-discovery".to_string()],
         security: vec!["none".to_string()],
@@ -577,7 +577,8 @@ fn capabilities() -> CapabilitySet {
             "fs.push.batch".to_string(),
             "fs.pull.batch".to_string(),
         ],
-    }
+    });
+    &CAPABILITIES
 }
 
 async fn handle_exec_request<S>(

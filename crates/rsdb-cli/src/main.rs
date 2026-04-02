@@ -839,14 +839,6 @@ fn init_tracing() {
 async fn connect_command(addr: &str, requested_name: Option<&str>) -> Result<()> {
     let addr = normalize_connect_addr(addr);
     let discovered = discover_target_at(&addr, 500).await.ok().flatten();
-    if let Some(warning) = discovered
-        .as_ref()
-        .and_then(|target| protocol_warning_text(target.protocol_version))
-    {
-        eprintln!(
-            "warning: {warning}; commands may fail until rsdb and rsdbd are updated together"
-        );
-    }
     let response = request(&addr, ControlRequest::Ping).await?;
     let protocol_version = match response {
         ControlResponse::Pong {
@@ -4860,9 +4852,6 @@ async fn run_shell_session(
                             ControlResponse::ShellExit { status } => {
                                 stdout.flush().await?;
                                 stderr.flush().await?;
-                                if !interactive && status != 0 {
-                                    return Ok(status);
-                                }
                                 return Ok(status);
                             }
                             ControlResponse::Error { code, message } => {

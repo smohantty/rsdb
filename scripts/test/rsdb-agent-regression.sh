@@ -304,10 +304,14 @@ import sys
 
 obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
 targets = obj["data"]["targets"]
+expected = sys.argv[2]
+# Normalize: discover returns addr:port, but TARGET may be bare IP
+def target_matches(t, expected):
+    return t == expected or t == expected + ":27101" or t.rsplit(":", 1)[0] == expected
 assert targets, obj
 assert any(target["compatible"] for target in targets), obj
-assert any(target["target"] == sys.argv[2] for target in targets), obj
-assert any("fs.list" in target["supported_operations"] for target in targets if target["target"] == sys.argv[2]), obj
+assert any(target_matches(target["target"], expected) for target in targets), obj
+assert any("fs.list" in target["supported_operations"] for target in targets if target_matches(target["target"], expected)), obj
 PY
 
 agent_cmd exec -- printf 'agent-exec-ok\n' > "$EXEC_OUTPUT"
