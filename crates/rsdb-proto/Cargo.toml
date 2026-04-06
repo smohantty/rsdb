@@ -5,16 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+dhat = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
 [features]
-dhat-heap = []
-
-[dev-dependencies]
-dhat.workspace = true
+dhat-heap = ["dep:dhat"]
 
 [lints]
 workspace = true

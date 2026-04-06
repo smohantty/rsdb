@@ -1,4 +1,5 @@
-#[cfg(feature = "dhat-heap")]
+#![cfg(feature = "dhat-heap")]
+
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
@@ -64,7 +65,6 @@ fn make_stream_frame_bytes(payload_size: usize) -> Vec<u8> {
 /// Simulates the OLD shell reader loop: read_frame() per iteration,
 /// allocating a new Vec<u8> payload each time.
 #[test]
-#[ignore]
 fn shell_loop_old_read_frame() {
     let _profiler = dhat::Profiler::builder().testing().build();
 
@@ -99,7 +99,6 @@ fn shell_loop_old_read_frame() {
 /// Simulates the NEW shell reader loop: read_frame_into() reusing a
 /// single Vec<u8> across all iterations — zero per-frame allocations.
 #[test]
-#[ignore]
 fn shell_loop_new_read_frame_into() {
     let _profiler = dhat::Profiler::builder().testing().build();
 

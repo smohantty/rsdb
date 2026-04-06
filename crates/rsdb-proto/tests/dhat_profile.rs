@@ -1,4 +1,5 @@
-#[cfg(feature = "dhat-heap")]
+#![cfg(feature = "dhat-heap")]
+
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
@@ -18,7 +19,6 @@ impl<'a> SliceReader<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
-
 }
 
 impl AsyncRead for SliceReader<'_> {
@@ -101,7 +101,6 @@ fn make_json_response_bytes() -> Vec<u8> {
 }
 
 #[test]
-#[ignore]
 fn profile_read_frame() {
     let _profiler = dhat::Profiler::builder().testing().build();
 
@@ -131,7 +130,6 @@ fn profile_read_frame() {
 }
 
 #[test]
-#[ignore]
 fn profile_read_frame_into() {
     let _profiler = dhat::Profiler::builder().testing().build();
 
@@ -163,7 +161,6 @@ fn profile_read_frame_into() {
 }
 
 #[test]
-#[ignore]
 fn profile_json_request_decode() {
     let _profiler = dhat::Profiler::builder().testing().build();
 
@@ -194,7 +191,6 @@ fn profile_json_request_decode() {
 }
 
 #[test]
-#[ignore]
 fn profile_json_response_decode() {
     let _profiler = dhat::Profiler::builder().testing().build();
 
@@ -225,7 +221,6 @@ fn profile_json_response_decode() {
 }
 
 #[test]
-#[ignore]
 fn profile_discovery_round_trip() {
     let _profiler = dhat::Profiler::builder().testing().build();
 
