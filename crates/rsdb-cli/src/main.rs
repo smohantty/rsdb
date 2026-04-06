@@ -23,7 +23,7 @@ use rsdb_proto::{
     ContentEncoding, ControlRequest, ControlResponse, DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest,
     DiscoveryResponse, FrameKind, FsEntryKind, HEADER_LEN, HashAlgorithm,
     MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION, StreamChannel, TransferEntry, TransferEntryKind,
-    TransferRoot, decode_discovery_message, decode_json, decode_json_payload, decode_stream_frame,
+    TransferRoot, decode_discovery_message, decode_json, decode_json_payload,
     decode_stream_frame_header, encode_discovery_message, read_frame, read_frame_into,
     read_stream_frame_into, write_json_frame, write_stream_frame,
 };
@@ -4722,22 +4722,63 @@ async fn run_shell_session(
     }
     let (mut reader, writer) = tokio::io::split(stream);
     let mut writer = tokio::io::BufWriter::new(writer);
-    let (frame_tx, mut frame_rx) = mpsc::channel(32);
+    let (frame_tx, mut frame_rx) =
+        mpsc::channel::<Result<rsdb_proto::Frame, rsdb_proto::ProtocolError>>(4);
     tokio::spawn(async move {
+        let mut payload = Vec::with_capacity(DEFAULT_STREAM_CHUNK_SIZE);
+        let mut stdout = tokio::io::stdout();
+        let mut stderr = tokio::io::stderr();
         loop {
-            let frame = read_frame(&mut reader).await;
-            let should_stop = frame.is_err();
-            if frame_tx.send(frame).await.is_err() {
-                break;
-            }
-            if should_stop {
-                break;
+            let header = match read_frame_into(&mut reader, &mut payload).await {
+                Ok(h) => h,
+                Err(e) => {
+                    let _ = frame_tx.send(Err(e)).await;
+                    break;
+                }
+            };
+            if header.kind == FrameKind::Stream {
+                let stream = match decode_stream_frame_header(&header) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = frame_tx.send(Err(e)).await;
+                        break;
+                    }
+                };
+                if stream.request_id != REQUEST_ID {
+                    break;
+                }
+                if !payload.is_empty() {
+                    match stream.channel {
+                        StreamChannel::Stdout => {
+                            if stdout.write_all(&payload).await.is_err()
+                                || stdout.flush().await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        StreamChannel::Stderr => {
+                            if stderr.write_all(&payload).await.is_err()
+                                || stderr.flush().await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            } else {
+                let frame = rsdb_proto::Frame {
+                    header,
+                    payload: std::mem::take(&mut payload),
+                };
+                if frame_tx.send(Ok(frame)).await.is_err() {
+                    break;
+                }
+                payload = Vec::with_capacity(DEFAULT_STREAM_CHUNK_SIZE);
             }
         }
     });
 
-    let mut stdout = tokio::io::stdout();
-    let mut stderr = tokio::io::stderr();
     let mut stdin_open = interactive;
     let mut stdin_rx = interactive.then(start_stdin_pump);
     let _raw_mode = interactive.then(enable_local_raw_mode).transpose()?;
@@ -4797,32 +4838,11 @@ async fn run_shell_session(
                 };
                 trace!(kind = ?frame.header.kind, payload = frame.payload.len(), "received shell frame");
                 match frame.header.kind {
-                    FrameKind::Stream => {
-                        let chunk = decode_stream_frame(frame).context("invalid stream frame")?;
-                        ensure_request_id(chunk.request_id, REQUEST_ID)?;
-                        match chunk.channel {
-                            StreamChannel::Stdout => {
-                                if !chunk.payload.is_empty() {
-                                    stdout.write_all(&chunk.payload).await?;
-                                    stdout.flush().await?;
-                                }
-                            }
-                            StreamChannel::Stderr => {
-                                if !chunk.payload.is_empty() {
-                                    stderr.write_all(&chunk.payload).await?;
-                                    stderr.flush().await?;
-                                }
-                            }
-                            other => bail!("unexpected stream channel during shell: {other:?}"),
-                        }
-                    }
                     FrameKind::Response => {
                         let response: ControlResponse = decode_json(&frame, FrameKind::Response)
                             .context("invalid response frame")?;
                         match response {
                             ControlResponse::ShellExit { status } => {
-                                stdout.flush().await?;
-                                stderr.flush().await?;
                                 return Ok(status);
                             }
                             ControlResponse::Error { code, message } => {

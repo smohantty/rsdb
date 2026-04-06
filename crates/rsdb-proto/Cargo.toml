@@ -10,5 +10,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
+[features]
+dhat-heap = []
+
+[dev-dependencies]
+dhat.workspace = true
+
 [lints]
 workspace = true
