@@ -4728,6 +4728,13 @@ async fn run_shell_session(
         let mut payload = Vec::with_capacity(DEFAULT_STREAM_CHUNK_SIZE);
         let mut stdout = tokio::io::stdout();
         let mut stderr = tokio::io::stderr();
+
+        let send_io_error = |tx: &mpsc::Sender<_>, msg: &str| {
+            let err =
+                rsdb_proto::ProtocolError::Io(std::io::Error::other(msg.to_string()));
+            tx.try_send(Err(err)).ok();
+        };
+
         loop {
             let header = match read_frame_into(&mut reader, &mut payload).await {
                 Ok(h) => h,
@@ -4745,25 +4752,42 @@ async fn run_shell_session(
                     }
                 };
                 if stream.request_id != REQUEST_ID {
+                    send_io_error(
+                        &frame_tx,
+                        &format!(
+                            "request id mismatch: expected {REQUEST_ID}, got {}",
+                            stream.request_id
+                        ),
+                    );
                     break;
                 }
                 if !payload.is_empty() {
-                    match stream.channel {
+                    let result = match stream.channel {
                         StreamChannel::Stdout => {
-                            if stdout.write_all(&payload).await.is_err()
-                                || stdout.flush().await.is_err()
-                            {
-                                break;
-                            }
+                            stdout
+                                .write_all(&payload)
+                                .await
+                                .and(stdout.flush().await)
                         }
                         StreamChannel::Stderr => {
-                            if stderr.write_all(&payload).await.is_err()
-                                || stderr.flush().await.is_err()
-                            {
-                                break;
-                            }
+                            stderr
+                                .write_all(&payload)
+                                .await
+                                .and(stderr.flush().await)
                         }
-                        _ => break,
+                        other => {
+                            send_io_error(
+                                &frame_tx,
+                                &format!("unexpected stream channel during shell: {other:?}"),
+                            );
+                            break;
+                        }
+                    };
+                    if let Err(e) = result {
+                        let _ = frame_tx
+                            .send(Err(rsdb_proto::ProtocolError::Io(e)))
+                            .await;
+                        break;
                     }
                 }
             } else {
