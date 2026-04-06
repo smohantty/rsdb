@@ -20,7 +20,7 @@ use rsdb_proto::{
     ControlResponse, DEFAULT_STREAM_CHUNK_SIZE, DiscoveryRequest, DiscoveryResponse, ErrorCode,
     FrameKind, FsEntryKind, HEADER_LEN, HashAlgorithm, MAX_DISCOVERY_PAYLOAD_LEN, PROTOCOL_VERSION,
     ProtocolError, StreamChannel, TransferEntry, TransferEntryKind, TransferRoot,
-    decode_discovery_message, decode_json, decode_stream_frame, encode_discovery_message,
+    decode_discovery_message, decode_json, encode_discovery_message,
     read_frame, read_stream_frame_into, write_json_frame, write_stream_frame,
 };
 use rustix_openpty::rustix::fd::IntoRawFd as _;
@@ -2254,19 +2254,6 @@ where
         spawn_pipe_shell(command, args, &state.shell_path, &state.home_path)?;
     let (mut reader, writer) = tokio::io::split(stream);
     let mut writer = tokio::io::BufWriter::new(writer);
-    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(32);
-    tokio::spawn(async move {
-        loop {
-            let frame = read_frame(&mut reader).await;
-            let should_stop = frame.is_err();
-            if frame_tx.send(frame).await.is_err() {
-                break;
-            }
-            if should_stop {
-                break;
-            }
-        }
-    });
     write_json_frame(
         &mut writer,
         FrameKind::Response,
@@ -2291,7 +2278,59 @@ where
         .take()
         .ok_or_else(|| anyhow!("child stderr was not captured"))?;
 
-    let mut stdin_open = true;
+    let (stdin_err_tx, mut stdin_err_rx) = tokio::sync::mpsc::channel::<ProtocolError>(1);
+    tokio::spawn(async move {
+        let mut payload = Vec::with_capacity(DEFAULT_STREAM_CHUNK_SIZE);
+        loop {
+            let header = match read_stream_frame_into(&mut reader, &mut payload).await {
+                Ok(h) => h,
+                Err(ProtocolError::Io(err))
+                    if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    let _ = child_stdin.shutdown().await;
+                    break;
+                }
+                Err(e) => {
+                    let _ = stdin_err_tx.send(e).await;
+                    break;
+                }
+            };
+            if header.request_id != request_id {
+                let _ = stdin_err_tx
+                    .send(ProtocolError::Io(std::io::Error::other(format!(
+                        "stream frame request id mismatch: expected {request_id}, got {}",
+                        header.request_id
+                    ))))
+                    .await;
+                break;
+            }
+            if header.channel != StreamChannel::Stdin {
+                let _ = stdin_err_tx
+                    .send(ProtocolError::Io(std::io::Error::other(format!(
+                        "unexpected stream channel: expected {:?}, got {:?}",
+                        StreamChannel::Stdin,
+                        header.channel
+                    ))))
+                    .await;
+                break;
+            }
+            if !payload.is_empty() {
+                if let Err(e) = child_stdin.write_all(&payload).await {
+                    let _ = stdin_err_tx.send(ProtocolError::Io(e)).await;
+                    break;
+                }
+                if let Err(e) = child_stdin.flush().await {
+                    let _ = stdin_err_tx.send(ProtocolError::Io(e)).await;
+                    break;
+                }
+            }
+            if header.eof {
+                let _ = child_stdin.shutdown().await;
+                break;
+            }
+        }
+    });
+
     let mut stdout_open = true;
     let mut stderr_open = true;
     let mut exit_status = None;
@@ -2301,33 +2340,11 @@ where
 
     while stdout_open || stderr_open || exit_status.is_none() {
         tokio::select! {
-            frame = frame_rx.recv(), if stdin_open => {
-                match frame {
-                    Some(Ok(frame)) => {
-                        let chunk = decode_stream_frame(frame)?;
-                        expect_stream_chunk(&chunk, request_id, StreamChannel::Stdin)?;
-                        if !chunk.payload.is_empty() {
-                            child_stdin.write_all(&chunk.payload).await?;
-                            child_stdin.flush().await?;
-                        }
-                        if chunk.eof {
-                            child_stdin.shutdown().await?;
-                            stdin_open = false;
-                        }
-                    }
-                    Some(Err(ProtocolError::Io(err))) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        let _ = child_stdin.shutdown().await;
-                        stdin_open = false;
-                    }
-                    Some(Err(err)) => {
-                        send_error(&mut writer, request_id, ErrorCode::ExecFailed, err.into()).await?;
-                        writer.flush().await?;
-                        return Ok(());
-                    }
-                    None => {
-                        let _ = child_stdin.shutdown().await;
-                        stdin_open = false;
-                    }
+            err = stdin_err_rx.recv() => {
+                if let Some(err) = err {
+                    send_error(&mut writer, request_id, ErrorCode::ExecFailed, err.into()).await?;
+                    writer.flush().await?;
+                    return Ok(());
                 }
             }
             read = child_stdout.read(&mut stdout_buffer), if stdout_open => {
@@ -2366,10 +2383,6 @@ where
                 exit_status = Some(status.context("failed to wait for shell process")?);
             }
         }
-    }
-
-    if stdin_open {
-        let _ = child_stdin.shutdown().await;
     }
 
     let status = match exit_status {
@@ -2412,19 +2425,6 @@ where
     )?;
     let (mut reader, writer) = tokio::io::split(stream);
     let mut writer = tokio::io::BufWriter::new(writer);
-    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(32);
-    tokio::spawn(async move {
-        loop {
-            let frame = read_frame(&mut reader).await;
-            let should_stop = frame.is_err();
-            if frame_tx.send(frame).await.is_err() {
-                break;
-            }
-            if should_stop {
-                break;
-            }
-        }
-    });
     write_json_frame(
         &mut writer,
         FrameKind::Response,
@@ -2444,45 +2444,70 @@ where
 
     let (pty_input_tx, pty_input_rx) = tokio::sync::mpsc::channel(32);
     start_pty_input_pump(controller, pty_input_rx);
-    let mut pty_input_tx = Some(pty_input_tx);
-    let mut stdin_open = true;
+
+    let (stdin_err_tx, mut stdin_err_rx) = tokio::sync::mpsc::channel::<ProtocolError>(1);
+    tokio::spawn(async move {
+        let mut payload = Vec::with_capacity(DEFAULT_STREAM_CHUNK_SIZE);
+        loop {
+            let header = match read_stream_frame_into(&mut reader, &mut payload).await {
+                Ok(h) => h,
+                Err(ProtocolError::Io(err))
+                    if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    let _ = pty_input_tx.send(PtyInput::Close).await;
+                    break;
+                }
+                Err(e) => {
+                    let _ = pty_input_tx.send(PtyInput::Close).await;
+                    let _ = stdin_err_tx.send(e).await;
+                    break;
+                }
+            };
+            if header.request_id != request_id {
+                let _ = pty_input_tx.send(PtyInput::Close).await;
+                let _ = stdin_err_tx
+                    .send(ProtocolError::Io(std::io::Error::other(format!(
+                        "stream frame request id mismatch: expected {request_id}, got {}",
+                        header.request_id
+                    ))))
+                    .await;
+                break;
+            }
+            if header.channel != StreamChannel::Stdin {
+                let _ = pty_input_tx.send(PtyInput::Close).await;
+                let _ = stdin_err_tx
+                    .send(ProtocolError::Io(std::io::Error::other(format!(
+                        "unexpected stream channel: expected {:?}, got {:?}",
+                        StreamChannel::Stdin,
+                        header.channel
+                    ))))
+                    .await;
+                break;
+            }
+            if !payload.is_empty()
+                && pty_input_tx
+                    .send(PtyInput::Data(payload.clone()))
+                    .await
+                    .is_err()
+            {
+                break;
+            }
+            if header.eof {
+                let _ = pty_input_tx.send(PtyInput::Close).await;
+                break;
+            }
+        }
+    });
+
     let mut stdout_open = true;
     let mut wait = Box::pin(child.wait());
     let mut exit_status = None;
 
     while stdout_open || exit_status.is_none() {
         tokio::select! {
-            frame = frame_rx.recv(), if stdin_open => {
-                match frame {
-                    Some(Ok(frame)) => {
-                        let chunk = decode_stream_frame(frame)?;
-                        expect_stream_chunk(&chunk, request_id, StreamChannel::Stdin)?;
-                        if !chunk.payload.is_empty()
-                            && let Some(tx) = &pty_input_tx
-                        {
-                            tx.send(PtyInput::Data(chunk.payload)).await
-                                .context("failed to forward PTY stdin chunk")?;
-                        }
-                        if chunk.eof {
-                            if let Some(tx) = pty_input_tx.take() {
-                                let _ = tx.send(PtyInput::Close).await;
-                            }
-                            stdin_open = false;
-                        }
-                    }
-                    Some(Err(ProtocolError::Io(err))) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        if let Some(tx) = pty_input_tx.take() {
-                            let _ = tx.send(PtyInput::Close).await;
-                        }
-                        stdin_open = false;
-                    }
-                    Some(Err(err)) => return Err(err.into()),
-                    None => {
-                        if let Some(tx) = pty_input_tx.take() {
-                            let _ = tx.send(PtyInput::Close).await;
-                        }
-                        stdin_open = false;
-                    }
+            err = stdin_err_rx.recv() => {
+                if let Some(err) = err {
+                    return Err(err.into());
                 }
             }
             output = pty_output_rx.recv(), if stdout_open => {
@@ -2824,28 +2849,6 @@ fn shell_quote(value: &str) -> String {
     }
 
     format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-fn expect_stream_chunk(
-    chunk: &rsdb_proto::StreamFrame,
-    request_id: u32,
-    channel: StreamChannel,
-) -> Result<()> {
-    if chunk.request_id != request_id {
-        bail!(
-            "stream frame request id mismatch: expected {}, got {}",
-            request_id,
-            chunk.request_id
-        );
-    }
-    if chunk.channel != channel {
-        bail!(
-            "unexpected stream channel: expected {:?}, got {:?}",
-            channel,
-            chunk.channel
-        );
-    }
-    Ok(())
 }
 
 async fn send_error<W>(
