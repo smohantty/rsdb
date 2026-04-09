@@ -193,7 +193,7 @@ read -r TARGET_HOST TARGET_PORT <<<"$(split_target "$TARGET")"
 LOCAL_ROOT="$(mktemp -d /tmp/rsdb-agent-regression-XXXXXX)"
 ROUNDTRIP_DIR="$LOCAL_ROOT/roundtrip"
 REMOTE_ROOT="/tmp/rsdb-agent-regression-$(date +%s)"
-SCHEMA_OUTPUT="$LOCAL_ROOT/schema.json"
+SCHEMA_OUTPUT="$LOCAL_ROOT/schema.txt"
 DISCOVER_OUTPUT="$LOCAL_ROOT/discover.json"
 EXEC_OUTPUT="$LOCAL_ROOT/exec.json"
 EXEC_CWD_OUTPUT="$LOCAL_ROOT/exec-cwd.json"
@@ -240,57 +240,25 @@ printf 'hidden data\n' > "$LOCAL_ROOT/bundle/.hidden"
 printf 'single transfer file\n' > "$LOCAL_ROOT/lone.txt"
 
 "$RSDB_BIN" agent schema > "$SCHEMA_OUTPUT"
-assert_json_success "$SCHEMA_OUTPUT" "schema"
 python3 - "$SCHEMA_OUTPUT" <<'PY'
-import json
 import pathlib
 import sys
 
-obj = json.loads(pathlib.Path(sys.argv[1]).read_text())
-assert obj["data"]["response_envelope"] == "ok, data?, error?", obj
-assert obj["data"]["error_fields"] == "code, message, target?, retryable?, details?", obj
-names = {operation["name"] for operation in obj["data"]["operations"]}
-assert {
-    "schema",
-    "discover",
-    "exec",
-    "fs.stat",
-    "fs.list",
-    "fs.read",
-    "fs.write",
-    "fs.mkdir",
-    "fs.rm",
-    "fs.move",
-    "transfer.push",
-    "transfer.pull",
-} <= names, obj
-exec_schema = next(
-    operation for operation in obj["data"]["operations"] if operation["name"] == "exec"
-)
-assert exec_schema["returns"] == "target?, status, timed_out?, stdout?, stderr?", obj
-assert "stream_events" in exec_schema, obj
-assert exec_schema["stream_events"] == (
-    "stdout{target?,chunk}; stderr{target?,chunk}; completed{target?,status,timed_out?}; failed{error}"
-), obj
-discover_schema = next(
-    operation for operation in obj["data"]["operations"] if operation["name"] == "discover"
-)
-discover_option_names = [option["name"] for option in discover_schema["options"]]
-assert discover_option_names == ["probe-addr", "timeout-ms"], obj
-read_schema = next(
-    operation for operation in obj["data"]["operations"] if operation["name"] == "fs.read"
-)
-read_encoding = next(
-    option for option in read_schema["options"] if option["name"] == "encoding"
-)
-assert read_encoding["default"] == "utf8", obj
-write_schema = next(
-    operation for operation in obj["data"]["operations"] if operation["name"] == "fs.write"
-)
-write_encoding = next(
-    option for option in write_schema["options"] if option["name"] == "encoding"
-)
-assert write_encoding["default"] == "utf8", obj
+text = pathlib.Path(sys.argv[1]).read_text()
+assert text.startswith("rsdb agent\n"), "schema must start with 'rsdb agent'"
+assert "envelope: ok,data?,error? | error: code,message,target?,retryable?,details?" in text
+for op in [
+    "discover", "exec", "fs.stat", "fs.list", "fs.read",
+    "fs.write", "fs.mkdir", "fs.rm", "fs.move",
+    "transfer.push", "transfer.pull",
+]:
+    assert op in text, f"missing operation: {op}"
+assert "  => target?,status,timed_out?,stdout?,stderr?" in text, "exec returns missing"
+assert "  ~> stdout{target?,chunk}; stderr{target?,chunk}; completed{target?,status,timed_out?}; failed{error}" in text, "exec stream_events missing"
+assert "--probe-addr" in text, "discover probe-addr option missing"
+assert "--timeout-ms" in text, "discover timeout-ms option missing"
+assert "[--encoding <utf8|base64=utf8>]" in text, "encoding default missing"
+assert "--target <addr>" in text, "target flag missing"
 PY
 
 "$RSDB_BIN" agent discover \

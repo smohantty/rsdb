@@ -405,54 +405,6 @@ struct AgentDiscoverTarget {
     supported_operations: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct AgentSchemaData {
-    command_prefix: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    usage_rules: Vec<String>,
-    response_envelope: String,
-    error_fields: String,
-    operations: Vec<AgentSchemaOperation>,
-}
-
-#[derive(Debug, Serialize)]
-struct AgentSchemaOperation {
-    name: String,
-    purpose: String,
-    #[serde(default, skip_serializing_if = "is_false")]
-    target_required: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    options: Vec<AgentSchemaOption>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    positional: Vec<AgentSchemaPositional>,
-    returns: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream_events: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct AgentSchemaOption {
-    name: String,
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(rename = "default", skip_serializing_if = "Option::is_none")]
-    default_value: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    required: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    multiple: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct AgentSchemaPositional {
-    name: String,
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default, skip_serializing_if = "is_false")]
-    required: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    multiple: bool,
-}
 
 #[derive(Debug, Serialize)]
 struct AgentExecData {
@@ -1288,7 +1240,11 @@ async fn agent_schema_command(target: Option<&str>) -> Result<i32> {
         );
     }
 
-    emit_agent_success("schema", agent_schema())?;
+    let compact = agent_schema_compact();
+    let stdout = std::io::stdout();
+    let mut locked = stdout.lock();
+    locked.write_all(compact.as_bytes())?;
+    locked.flush()?;
     Ok(0)
 }
 
@@ -3076,247 +3032,52 @@ fn supported_agent_operations(features: &[String], compatible: bool) -> Vec<Stri
     operations
 }
 
-fn agent_schema() -> AgentSchemaData {
-    AgentSchemaData {
-        command_prefix: schema_command_prefix(),
-        usage_rules: vec![
-            "call discover when no target is known".to_string(),
-            "invoke an operation by replacing each '.' in operation.name with a space after command_prefix".to_string(),
-            "example: fs.read -> rsdb agent fs read".to_string(),
-            "example: transfer.pull -> rsdb agent transfer pull".to_string(),
-            "use exec for direct remote process execution".to_string(),
-            "use exec with --stream for long-running commands or live output".to_string(),
-            "use fs.* for small structured filesystem work".to_string(),
-            "use transfer.* for bulk files or directories".to_string(),
-            "pass --target for every target-scoped operation".to_string(),
-            "for exec, place -- before the remote command argv".to_string(),
-            "for transfer.push and transfer.pull, the last positional path is the destination; preceding paths are sources".to_string(),
-        ],
-        response_envelope: "ok, data?, error?".to_string(),
-        error_fields: "code, message, target?, retryable?, details?".to_string(),
-        operations: vec![
-            AgentSchemaOperation {
-                name: "schema".to_string(),
-                purpose: "return the static rsdb agent command contract".to_string(),
-                target_required: false,
-                options: Vec::new(),
-                positional: Vec::new(),
-                returns:
-                    "command_prefix[], usage_rules[], response_envelope, error_fields, operations[]"
-                        .to_string(),
-                stream_events: None,
-            },
-            AgentSchemaOperation {
-                name: "discover".to_string(),
-                purpose: "find reachable targets and report per-target supported operations"
-                    .to_string(),
-                target_required: false,
-                options: vec![
-                    schema_option("probe-addr", "string", false, false),
-                    schema_option("timeout-ms", "u64", false, false),
-                ],
-                positional: Vec::new(),
-                returns: "targets[{target,server_id,device_name?,platform?,protocol_version,compatible,supported_operations[]}]".to_string(),
-                stream_events: None,
-            },
-            AgentSchemaOperation {
-                name: "exec".to_string(),
-                purpose: "run one direct remote process".to_string(),
-                target_required: true,
-                options: vec![
-                    schema_option("stream", "bool", false, false),
-                    schema_option("check", "bool", false, false),
-                    schema_option("cwd", "string", false, false),
-                    schema_option("timeout-secs", "u64", false, false),
-                ],
-                positional: vec![schema_positional("command", "string", true, true)],
-                returns: "target?, status, timed_out?, stdout?, stderr?".to_string(),
-                stream_events: Some(
-                    "stdout{target?,chunk}; stderr{target?,chunk}; completed{target?,status,timed_out?}; failed{error}"
-                        .to_string(),
-                ),
-            },
-            AgentSchemaOperation {
-                name: "fs.stat".to_string(),
-                purpose: "read structured metadata for one remote path".to_string(),
-                target_required: true,
-                options: vec![schema_option("hash", "enum(sha256)", false, false)],
-                positional: vec![schema_positional("path", "string", true, false)],
-                returns: "exists, kind?, size?, sha256?".to_string(),
-                stream_events: None,
-            },
-            AgentSchemaOperation {
-                name: "fs.list".to_string(),
-                purpose: "list a remote path or directory tree".to_string(),
-                target_required: true,
-                options: vec![
-                    schema_option("recursive", "bool", false, false),
-                    schema_option("max-depth", "u32", false, false),
-                    schema_option("include-hidden", "bool", false, false),
-                    schema_option("hash", "enum(sha256)", false, false),
-                ],
-                positional: vec![schema_positional("path", "string", true, false)],
-                returns: "entries[{path,kind,size,sha256?}]".to_string(),
-                stream_events: None,
-            },
-            AgentSchemaOperation {
-                name: "fs.read".to_string(),
-                purpose: "read one small remote file inline".to_string(),
-                target_required: true,
-                options: vec![
-                    schema_option_with_default(
-                        "encoding",
-                        "enum(utf8|base64)",
-                        "utf8",
-                        false,
-                        false,
-                    ),
-                    schema_option("max-bytes", "u64", false, false),
-                ],
-                positional: vec![schema_positional("path", "string", true, false)],
-                returns: "content, bytes, truncated?".to_string(),
-                stream_events: None,
-            },
-            AgentSchemaOperation {
-                name: "fs.write".to_string(),
-                purpose: "write one small remote file".to_string(),
-                target_required: true,
-                options: vec![
-                    schema_option("input-file", "string", false, false),
-                    schema_option("stdin", "bool", false, false),
-                    schema_option_with_default(
-                        "encoding",
-                        "enum(utf8|base64)",
-                        "utf8",
-                        false,
-                        false,
-                    ),
-                    schema_option("mode", "octal-string", false, false),
-                    schema_option("create-parent", "bool", false, false),
-                    schema_option("atomic", "bool", false, false),
-                    schema_option("if-missing", "bool", false, false),
-                    schema_option("if-sha256", "string", false, false),
-                ],
-                positional: vec![schema_positional("path", "string", true, false)],
-                returns: "bytes_written, sha256?, changed?".to_string(),
-                stream_events: None,
-            },
-            AgentSchemaOperation {
-                name: "fs.mkdir".to_string(),
-                purpose: "create a remote directory".to_string(),
-                target_required: true,
-                options: vec![
-                    schema_option("parents", "bool", false, false),
-                    schema_option("mode", "octal-string", false, false),
-                ],
-                positional: vec![schema_positional("path", "string", true, false)],
-                returns: "created?".to_string(),
-                stream_events: None,
-            },
-            AgentSchemaOperation {
-                name: "fs.rm".to_string(),
-                purpose: "remove a remote file or directory".to_string(),
-                target_required: true,
-                options: vec![
-                    schema_option("recursive", "bool", false, false),
-                    schema_option("force", "bool", false, false),
-                    schema_option("if-exists", "bool", false, false),
-                ],
-                positional: vec![schema_positional("path", "string", true, false)],
-                returns: "removed?".to_string(),
-                stream_events: None,
-            },
-            AgentSchemaOperation {
-                name: "fs.move".to_string(),
-                purpose: "rename or move one remote path".to_string(),
-                target_required: true,
-                options: vec![schema_option("overwrite", "bool", false, false)],
-                positional: vec![
-                    schema_positional("source", "string", true, false),
-                    schema_positional("destination", "string", true, false),
-                ],
-                returns: "overwritten?".to_string(),
-                stream_events: None,
-            },
-            AgentSchemaOperation {
-                name: "transfer.push".to_string(),
-                purpose: "push bulk local files or directories".to_string(),
-                target_required: true,
-                options: vec![
-                    schema_option("verify", "enum(size|sha256)", false, false),
-                    schema_option("atomic", "bool", false, false),
-                    schema_option("if-changed", "bool", false, false),
-                ],
-                positional: vec![
-                    schema_positional("local-sources", "string", true, true),
-                    schema_positional("remote-destination", "string", true, false),
-                ],
-                returns: "target?, skipped, verification?, verified?, atomic?".to_string(),
-                stream_events: None,
-            },
-            AgentSchemaOperation {
-                name: "transfer.pull".to_string(),
-                purpose: "pull bulk remote files or directories".to_string(),
-                target_required: true,
-                options: vec![schema_option("verify", "enum(size|sha256)", false, false)],
-                positional: vec![
-                    schema_positional("remote-sources", "string", true, true),
-                    schema_positional("local-destination", "string", true, false),
-                ],
-                returns: "target?, verification?, verified?".to_string(),
-                stream_events: None,
-            },
-        ],
-    }
-}
+fn agent_schema_compact() -> String {
+    "\
+rsdb agent
+rules:
+- discover when no target known
+- replace '.' with space: fs.read -> rsdb agent fs read
+- pass --target <addr> for exec/fs.*/transfer.*
+- exec: place -- before remote argv
+- transfer: last positional = destination
+envelope: ok,data?,error? | error: code,message,target?,retryable?,details?
 
-fn schema_command_prefix() -> Vec<String> {
-    vec!["rsdb".to_string(), "agent".to_string()]
-}
+discover [--probe-addr <str>] [--timeout-ms <u64>]  # find reachable targets and report per-target supported operations
+  => targets[{target,server_id,device_name?,platform?,protocol_version,compatible,supported_operations[]}]
 
-fn schema_option(
-    name: &'static str,
-    kind: &'static str,
-    required: bool,
-    multiple: bool,
-) -> AgentSchemaOption {
-    AgentSchemaOption {
-        name: name.to_string(),
-        kind: kind.to_string(),
-        default_value: None,
-        required,
-        multiple,
-    }
-}
+exec --target <addr> [--stream] [--check] [--cwd <str>] [--timeout-secs <u64>] -- <command...>  # run one direct remote process
+  => target?,status,timed_out?,stdout?,stderr?
+  ~> stdout{target?,chunk}; stderr{target?,chunk}; completed{target?,status,timed_out?}; failed{error}
 
-fn schema_option_with_default(
-    name: &'static str,
-    kind: &'static str,
-    default_value: &'static str,
-    required: bool,
-    multiple: bool,
-) -> AgentSchemaOption {
-    AgentSchemaOption {
-        name: name.to_string(),
-        kind: kind.to_string(),
-        default_value: Some(default_value.to_string()),
-        required,
-        multiple,
-    }
-}
+fs.stat --target <addr> <path> [--hash <sha256>]  # read structured metadata for one remote path
+  => exists,kind?,size?,sha256?
 
-fn schema_positional(
-    name: &'static str,
-    kind: &'static str,
-    required: bool,
-    multiple: bool,
-) -> AgentSchemaPositional {
-    AgentSchemaPositional {
-        name: name.to_string(),
-        kind: kind.to_string(),
-        required,
-        multiple,
-    }
+fs.list --target <addr> <path> [--recursive] [--max-depth <u32>] [--include-hidden] [--hash <sha256>]  # list a remote path or directory tree
+  => entries[{path,kind,size,sha256?}]
+
+fs.read --target <addr> <path> [--encoding <utf8|base64=utf8>] [--max-bytes <u64>]  # read one small remote file inline
+  => content,bytes,truncated?
+
+fs.write --target <addr> <path> [--input-file <str>] [--stdin] [--encoding <utf8|base64=utf8>] [--mode <octal>] [--create-parent] [--atomic] [--if-missing] [--if-sha256 <str>]  # write one small remote file
+  => bytes_written,sha256?,changed?
+
+fs.mkdir --target <addr> <path> [--parents] [--mode <octal>]  # create a remote directory
+  => created?
+
+fs.rm --target <addr> <path> [--recursive] [--force] [--if-exists]  # remove a remote file or directory
+  => removed?
+
+fs.move --target <addr> <source> <destination> [--overwrite]  # rename or move one remote path
+  => overwritten?
+
+transfer.push --target <addr> <local-sources...> <remote-destination> [--verify <size|sha256>] [--atomic] [--if-changed]  # push bulk local files or directories
+  => target?,skipped,verification?,verified?,atomic?
+
+transfer.pull --target <addr> <remote-sources...> <local-destination> [--verify <size|sha256>]  # pull bulk remote files or directories
+  => target?,verification?,verified?
+"
+    .to_string()
 }
 
 fn is_false(value: &bool) -> bool {
@@ -5525,238 +5286,72 @@ mod tests {
     }
 
     #[test]
-    fn agent_schema_lists_core_operations() {
-        let schema = agent_schema();
-        let names = schema
-            .operations
-            .iter()
-            .map(|operation| operation.name.as_str())
-            .collect::<Vec<_>>();
-
-        assert!(names.contains(&"schema"));
-        assert!(names.contains(&"discover"));
-        assert!(names.contains(&"exec"));
-        assert!(names.contains(&"fs.list"));
-        assert!(names.contains(&"fs.read"));
-        assert!(names.contains(&"fs.write"));
-        assert!(names.contains(&"fs.mkdir"));
-        assert!(names.contains(&"fs.rm"));
-        assert!(names.contains(&"fs.move"));
-        assert!(names.contains(&"transfer.push"));
-        assert!(names.contains(&"transfer.pull"));
+    fn agent_schema_compact_contains_all_operations() {
+        let compact = agent_schema_compact();
+        // All 11 non-meta operations must appear
+        assert!(compact.contains("discover "));
+        assert!(compact.contains("exec --target <addr>"));
+        assert!(compact.contains("fs.stat --target <addr>"));
+        assert!(compact.contains("fs.list --target <addr>"));
+        assert!(compact.contains("fs.read --target <addr>"));
+        assert!(compact.contains("fs.write --target <addr>"));
+        assert!(compact.contains("fs.mkdir --target <addr>"));
+        assert!(compact.contains("fs.rm --target <addr>"));
+        assert!(compact.contains("fs.move --target <addr>"));
+        assert!(compact.contains("transfer.push --target <addr>"));
+        assert!(compact.contains("transfer.pull --target <addr>"));
+        // Meta "schema" operation is excluded
+        assert!(!compact.contains("\nschema "));
     }
 
     #[test]
-    fn agent_schema_marks_target_scoped_operations() {
-        let schema = agent_schema();
-        let by_name = schema
-            .operations
-            .iter()
-            .map(|operation| (operation.name.as_str(), operation.target_required))
-            .collect::<BTreeMap<_, _>>();
-
-        assert_eq!(by_name.get("exec"), Some(&true));
-        assert_eq!(by_name.get("fs.write"), Some(&true));
-        assert_eq!(by_name.get("transfer.pull"), Some(&true));
-        assert_eq!(by_name.get("schema"), Some(&false));
-        assert_eq!(by_name.get("discover"), Some(&false));
+    fn agent_schema_compact_has_correct_structure() {
+        let compact = agent_schema_compact();
+        // Header
+        assert!(compact.starts_with("rsdb agent\n"));
+        assert!(compact.contains("rules:\n"));
+        assert!(compact.contains("envelope:"));
+        // Returns markers
+        assert!(compact.contains("  => "));
+        // Stream events for exec
+        assert!(compact.contains("  ~> "));
+        // Purpose comments
+        assert!(compact.contains("  # "));
+        // Response field names match JSON exactly (no abbreviations)
+        assert!(compact.contains("protocol_version"));
+        assert!(compact.contains("supported_operations[]"));
+        assert!(!compact.contains("proto_ver"));
+        assert!(!compact.contains("supported_ops"));
     }
 
     #[test]
-    fn agent_schema_exec_declares_stream_and_check_options() {
-        let schema = agent_schema();
-        let exec = schema
-            .operations
-            .iter()
-            .find(|operation| operation.name == "exec")
-            .expect("exec operation should exist");
-
-        let option_names = exec
-            .options
-            .iter()
-            .map(|option| option.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(option_names, vec!["stream", "check", "cwd", "timeout-secs"]);
-        assert!(exec.target_required);
-        assert_eq!(exec.positional.len(), 1);
-        assert_eq!(exec.positional[0].name, "command");
-        assert!(exec.positional[0].multiple);
-        assert_eq!(
-            exec.returns,
-            "target?, status, timed_out?, stdout?, stderr?"
-        );
-        assert_eq!(
-            exec.stream_events.as_deref(),
-            Some(
-                "stdout{target?,chunk}; stderr{target?,chunk}; completed{target?,status,timed_out?}; failed{error}"
-            )
-        );
+    fn agent_schema_compact_uses_correct_type_abbreviations() {
+        let compact = agent_schema_compact();
+        // string -> str
+        assert!(compact.contains("<str>"));
+        // octal-string -> octal
+        assert!(compact.contains("<octal>"));
+        // enum(sha256) -> sha256
+        assert!(compact.contains("[--hash <sha256>]"));
+        // enum(utf8|base64) with default
+        assert!(compact.contains("[--encoding <utf8|base64=utf8>]"));
+        // enum(size|sha256) without default
+        assert!(compact.contains("[--verify <size|sha256>]"));
     }
 
     #[test]
-    fn agent_schema_lists_all_fs_operations_as_target_scoped() {
-        let schema = agent_schema();
-        let fs_operations = schema
-            .operations
-            .iter()
-            .filter(|operation| operation.name.starts_with("fs."))
-            .collect::<Vec<_>>();
-
-        assert_eq!(fs_operations.len(), 7);
-        assert!(
-            fs_operations
-                .iter()
-                .all(|operation| operation.target_required)
-        );
-    }
-
-    #[test]
-    fn agent_schema_includes_shared_response_contract() {
-        let schema = agent_schema();
-
-        assert_eq!(schema.command_prefix, vec!["rsdb", "agent"]);
-        assert_eq!(schema.response_envelope, "ok, data?, error?");
-        assert_eq!(
-            schema.error_fields,
-            "code, message, target?, retryable?, details?"
-        );
-    }
-
-    #[test]
-    fn agent_schema_summarizes_operation_outputs() {
-        let schema = agent_schema();
-        let by_name = schema
-            .operations
-            .iter()
-            .map(|operation| (operation.name.as_str(), operation.returns.as_str()))
-            .collect::<BTreeMap<_, _>>();
-
-        assert_eq!(
-            by_name.get("schema"),
-            Some(&"command_prefix[], usage_rules[], response_envelope, error_fields, operations[]")
-        );
-        assert_eq!(
-            by_name.get("discover"),
-            Some(
-                &"targets[{target,server_id,device_name?,platform?,protocol_version,compatible,supported_operations[]}]"
-            )
-        );
-        assert_eq!(by_name.get("fs.read"), Some(&"content, bytes, truncated?"));
-        assert_eq!(
-            by_name.get("transfer.push"),
-            Some(&"target?, skipped, verification?, verified?, atomic?")
-        );
-        assert_eq!(
-            by_name.get("transfer.pull"),
-            Some(&"target?, verification?, verified?")
-        );
-    }
-
-    #[test]
-    fn agent_schema_omits_discover_port_and_marks_encoding_defaults() {
-        let schema = agent_schema();
-        let discover = schema
-            .operations
-            .iter()
-            .find(|operation| operation.name == "discover")
-            .expect("discover operation should exist");
-        let read = schema
-            .operations
-            .iter()
-            .find(|operation| operation.name == "fs.read")
-            .expect("fs.read operation should exist");
-        let write = schema
-            .operations
-            .iter()
-            .find(|operation| operation.name == "fs.write")
-            .expect("fs.write operation should exist");
-
-        let discover_option_names = discover
-            .options
-            .iter()
-            .map(|option| option.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(discover_option_names, vec!["probe-addr", "timeout-ms"]);
-
-        let read_encoding = read
-            .options
-            .iter()
-            .find(|option| option.name == "encoding")
-            .expect("fs.read encoding option should exist");
-        assert_eq!(read_encoding.default_value.as_deref(), Some("utf8"));
-
-        let write_encoding = write
-            .options
-            .iter()
-            .find(|option| option.name == "encoding")
-            .expect("fs.write encoding option should exist");
-        assert_eq!(write_encoding.default_value.as_deref(), Some("utf8"));
-    }
-
-    #[test]
-    fn agent_schema_exposes_invocation_rules_and_transfer_destination_roles() {
-        let schema = agent_schema();
-        let pull = schema
-            .operations
-            .iter()
-            .find(|operation| operation.name == "transfer.pull")
-            .expect("transfer.pull operation should exist");
-
-        assert!(
-            schema
-                .usage_rules
-                .contains(&"invoke an operation by replacing each '.' in operation.name with a space after command_prefix".to_string())
-        );
-        assert!(
-            schema
-                .usage_rules
-                .contains(&"example: fs.read -> rsdb agent fs read".to_string())
-        );
-        assert!(
-            schema
-                .usage_rules
-                .contains(&"example: transfer.pull -> rsdb agent transfer pull".to_string())
-        );
-        assert!(
-            schema
-                .usage_rules
-                .contains(&"for exec, place -- before the remote command argv".to_string())
-        );
-        assert!(
-            schema
-                .usage_rules
-                .contains(&"for transfer.push and transfer.pull, the last positional path is the destination; preceding paths are sources".to_string())
-        );
-
-        let pull_positional_names = pull
-            .positional
-            .iter()
-            .map(|positional| positional.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            pull_positional_names,
-            vec!["remote-sources", "local-destination"]
-        );
-    }
-
-    #[test]
-    fn agent_schema_uses_named_transfer_sources_and_destinations() {
-        let schema = agent_schema();
-        let push = schema
-            .operations
-            .iter()
-            .find(|operation| operation.name == "transfer.push")
-            .expect("transfer.push operation should exist");
-
-        let push_positional_names = push
-            .positional
-            .iter()
-            .map(|positional| positional.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            push_positional_names,
-            vec!["local-sources", "remote-destination"]
-        );
+    fn agent_schema_compact_exec_has_double_dash_before_command() {
+        let compact = agent_schema_compact();
+        let exec_line = compact
+            .lines()
+            .find(|line| line.starts_with("exec "))
+            .expect("exec line should exist");
+        // -- must come before <command...>
+        let dash_pos = exec_line.find("--").expect("-- should exist in exec line");
+        let cmd_pos = exec_line
+            .find("<command...>")
+            .expect("<command...> should exist");
+        assert!(dash_pos < cmd_pos, "-- must precede <command...>");
     }
 
     #[test]
