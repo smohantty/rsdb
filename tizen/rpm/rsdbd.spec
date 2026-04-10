@@ -2,7 +2,7 @@
 %global _build_id_links none
 
 Name:           rsdbd
-Version:        0.1.0
+Version:        0.1.1
 Release:        1
 Summary:        RSDB root daemon
 License:        MIT OR Apache-2.0
