@@ -1,91 +1,112 @@
 # RSDB
 
-RSDB lets you connect from a Linux host to a Tizen device over IP.
+RSDB is a Rust workspace for controlling a reachable `rsdbd` daemon over IP.
+The current repository contains:
 
-## Prerequisites
+- `rsdb`: a host CLI for discovery, saved-target management, ping/capability
+  checks, shell access, bulk push/pull, remote editing, and a machine-facing
+  `agent` surface.
+- `rsdb-proto`: the shared wire protocol and structured request/response types.
+- `rsdbd`: the target-side daemon packaged for Tizen-style `systemd` + `rpm`
+  environments.
+- Shell-script entrypoints for live regression, development-device daemon
+  refresh, and a local loopback harness.
 
-### Host
+`AGENTS.md` is the task router. `ARCHITECTURE.md` and `docs/` are the
+repository-local system of record.
 
-- Linux
-- Rust and Cargo
-- `~/.cargo/bin` in `PATH` if you install the CLI for your user
+## Quickstart
 
-### Target device
+Build the workspace:
 
-- Tizen device with `systemd`
-- `rpm`
-- root access for package install or upgrade
+```bash
+cargo build --workspace
+```
 
-## Install the CLI from source
+Run the Rust test suite:
 
-Clone this repository, then from the repo root install the CLI:
+```bash
+cargo test --workspace
+```
+
+Install the host CLI:
 
 ```bash
 cargo install --path crates/rsdb-cli --force
 ```
 
-If you want a system-wide install instead:
-
-```bash
-sudo cargo install --path crates/rsdb-cli --root /usr/local --force
-```
-
-## Install the daemon from the release page
-
-Open the latest release page for this repository.
-
-Download the RPM that matches your device:
-
-- `rsdbd-*.aarch64.rpm`
-- `rsdbd-*.armv7l.rpm`
-
-Copy the RPM to the target device, then install or upgrade it:
-
-```bash
-rpm -Uvh rsdbd-*.aarch64.rpm
-```
-
-Or for 32-bit ARM:
-
-```bash
-rpm -Uvh rsdbd-*.armv7l.rpm
-```
-
-The RPM:
-
-- installs `rsdbd`
-- installs and enables `rsdbd.service`
-- preserves `/etc/rsdbd.env` on upgrade
-- attempts to restart the service automatically
-
-If the service does not come up after install, the RPM prints the exact commands to check status and logs.
-
-## Notes
-
-- The default port for discovery and control traffic is `27101`
-- If you want quieter daemon logs after install, set `RUST_LOG=off` in `/etc/rsdbd.env` and restart `rsdbd.service`
-
-## Local Loopback Dev Mode
-
-For fast host-side development, you can run both the CLI and the daemon on the
-same Linux machine over loopback TCP:
+Run the local loopback harness:
 
 ```bash
 ./scripts/dev/local-loopback.sh
 ```
 
-That command:
+## Target Device Requirements
 
-- builds `rsdb` and `rsdbd`
-- starts `rsdbd` on `127.0.0.1:27131`
-- uses an isolated `XDG_CONFIG_HOME` under a temp run directory
-- runs `cargo test --workspace`
-- runs the existing shell/transfer and agent regression smoke scripts against the local daemon
+- `systemd`
+- `rpm`
+- root access for install or upgrade
 
-If you want to keep the daemon running for repeated manual checks:
+## Install `rsdbd` From An RPM
+
+The packaging inputs live under `tizen/rpm/`, and the repository currently also
+contains checked-in versioned RPMs under `tizen/rpm/sources/`.
+
+Use an RPM that matches the device architecture:
+
+- `rsdbd-*.aarch64.rpm`
+- `rsdbd-*.armv7l.rpm`
+
+Install or upgrade it on the device:
 
 ```bash
-./scripts/dev/local-loopback-up.sh
-./scripts/test/local-loopback-smoke.sh --run-dir /tmp/rsdb-loopback-XXXXXX
-./scripts/dev/local-loopback-down.sh --run-dir /tmp/rsdb-loopback-XXXXXX
+# aarch64
+rpm -Uvh rsdbd-*.aarch64.rpm
+
+# armv7l
+rpm -Uvh rsdbd-*.armv7l.rpm
 ```
+
+The current package installs:
+
+- `/usr/bin/rsdbd`
+- `/usr/lib/systemd/system/rsdbd.service`
+- `/etc/rsdbd.env`
+
+On upgrade, `/etc/rsdbd.env` is preserved as an RPM `%config(noreplace)` file.
+The package attempts to restart `rsdbd.service` and prints exact follow-up
+commands if the service does not come back cleanly.
+
+## Runtime Facts
+
+- The default discovery and control port is `27101`.
+- Saved targets live in `$XDG_CONFIG_HOME/rsdb/targets.json` or
+  `~/.config/rsdb/targets.json`.
+- The machine-facing command surface is `rsdb agent ...`.
+- `rsdb agent schema` prints the current agent contract summary.
+- `rsdbd` currently advertises `security: ["none"]`. There is no
+  authentication or transport encryption in this codebase today.
+
+## Primary Operational Entry Points
+
+- Build a fresh device RPM manually:
+  `cargo tizen rpm --package rsdbd --arch <aarch64|armv7l> --release`
+- Update `rsdbd` on a development device:
+  `./scripts/dev-update-rsdbd.sh`
+- Run shell and transfer regression smoke against a device:
+  `./scripts/test/rsdb-regression.sh`
+- Run machine-facing agent regression smoke against a device:
+  `./scripts/test/rsdb-agent-regression.sh`
+- Install bash completion:
+  `./scripts/install-completions.sh`
+
+There is no checked-in GitHub release automation script in this repo today.
+
+## Docs
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): top-level package and protocol map
+- [`docs/index.md`](docs/index.md): documentation catalog
+- [`docs/operations.md`](docs/operations.md): scripted workflows and their
+  preconditions
+- [`docs/testing.md`](docs/testing.md): verification matrix
+- [`docs/quality.md`](docs/quality.md): current maintenance-quality snapshot
